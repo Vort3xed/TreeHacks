@@ -257,9 +257,34 @@ class ObjectLabeler:
     def _compute_obb(self, points: np.ndarray) -> Optional[dict]:
         """
         Compute a tight oriented bounding box using Open3D.
-        Applies statistical outlier removal for cleaner bounds.
+        First isolates the largest cluster via DBSCAN to avoid stray points
+        stretching the box, then applies statistical outlier removal,
+        then computes the OBB.
         """
         import open3d as o3d
+
+        if len(points) < 10:
+            return None
+
+        # DBSCAN: isolate largest concentration of points
+        if len(points) > 100:
+            pcd_cluster = o3d.geometry.PointCloud()
+            pcd_cluster.points = o3d.utility.Vector3dVector(points)
+            try:
+                # eps = adaptive: use median nearest-neighbor distance
+                dists = np.asarray(pcd_cluster.compute_nearest_neighbor_distance())
+                eps = float(np.median(dists) * 2.0)
+                eps = max(eps, 0.01)  # floor
+                labels = np.asarray(pcd_cluster.cluster_dbscan(
+                    eps=eps, min_points=10, print_progress=False
+                ))
+                if len(labels) > 0 and labels.max() >= 0:
+                    # Keep only the largest cluster
+                    unique, counts = np.unique(labels[labels >= 0], return_counts=True)
+                    largest_label = unique[np.argmax(counts)]
+                    points = points[labels == largest_label]
+            except Exception:
+                pass  # fall through to use all points
 
         if len(points) < 10:
             return None
@@ -276,24 +301,57 @@ class ObjectLabeler:
 
         try:
             obb = pcd.get_oriented_bounding_box()
-            center = obb.center.tolist()
-            extent = obb.extent.tolist()
-            rotation = np.asarray(obb.R).tolist()
-            corners = np.asarray(obb.get_box_points()).tolist()
+            center = np.asarray(obb.center)
+            extent = np.asarray(obb.extent)
+            R = np.asarray(obb.R)
+
+            # Compute 8 corners ourselves from center, half-extent, rotation
+            # so the ordering is guaranteed correct for wireframe rendering.
+            # Corners of a unit cube centered at origin:
+            #   (+-1, +-1, +-1) * half_extent, rotated by R, translated by center
+            he = extent / 2.0
+            signs = np.array([
+                [-1, -1, -1],
+                [+1, -1, -1],
+                [+1, +1, -1],
+                [-1, +1, -1],
+                [-1, -1, +1],
+                [+1, -1, +1],
+                [+1, +1, +1],
+                [-1, +1, +1],
+            ], dtype=np.float64)
+            local_corners = signs * he  # (8, 3)
+            corners = (R @ local_corners.T).T + center  # (8, 3)
+
+            return {
+                'center': center.tolist(),
+                'extent': extent.tolist(),
+                'rotation': R.tolist(),
+                'corners': corners.tolist(),
+            }
         except Exception:
             # Fallback to AABB
             aabb = pcd.get_axis_aligned_bounding_box()
-            center = aabb.get_center().tolist()
-            extent = (aabb.get_max_bound() - aabb.get_min_bound()).tolist()
-            rotation = np.eye(3).tolist()
-            corners = np.asarray(aabb.get_box_points()).tolist()
-
-        return {
-            'center': center,
-            'extent': extent,
-            'rotation': rotation,
-            'corners': corners,
-        }
+            mn = np.asarray(aabb.get_min_bound())
+            mx = np.asarray(aabb.get_max_bound())
+            center = ((mn + mx) / 2.0).tolist()
+            extent = (mx - mn).tolist()
+            corners_aabb = np.array([
+                [mn[0], mn[1], mn[2]],
+                [mx[0], mn[1], mn[2]],
+                [mx[0], mx[1], mn[2]],
+                [mn[0], mx[1], mn[2]],
+                [mn[0], mn[1], mx[2]],
+                [mx[0], mn[1], mx[2]],
+                [mx[0], mx[1], mx[2]],
+                [mn[0], mx[1], mx[2]],
+            ])
+            return {
+                'center': center,
+                'extent': extent,
+                'rotation': np.eye(3).tolist(),
+                'corners': corners_aabb.tolist(),
+            }
 
     @staticmethod
     def _deduplicate_detections(detections: list[dict]) -> list[dict]:

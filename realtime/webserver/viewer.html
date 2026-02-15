@@ -170,8 +170,14 @@
       <div class="text-sm font-semibold text-white/80 border-b border-white/10 pb-2">Object Labeling (SAM3)</div>
 
       <div class="space-y-2">
+        <!-- Prompt mode toggle -->
+        <div class="flex items-center justify-between">
+          <span class="stat-label">Prompt Mode</span>
+          <button id="prompt-mode-toggle" class="btn-secondary text-xs px-3 py-1">Direct</button>
+        </div>
+
         <div>
-          <label class="stat-label block mb-1">Object prompts (comma-separated)</label>
+          <label id="prompt-mode-label" class="stat-label block mb-1">Object prompts (comma-separated)</label>
           <input type="text" id="label-prompts" placeholder="chair, table, monitor, person..."
             class="w-full bg-white/10 text-white text-sm rounded-lg px-3 py-2 border border-white/10
             placeholder:text-white/30 focus:outline-none focus:border-accent-blue/50" />

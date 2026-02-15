@@ -26,6 +26,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
+
 from pipeline import IncrementalPi3
 from object_labeler import ObjectLabeler, FrameData
 
@@ -261,7 +264,7 @@ async def health():
 
 @app.post("/reset")
 async def reset():
-    """Reset the pipeline state."""
+    """Reset pipeline state and wipe saved frames/cloud from disk."""
     with processing_lock:
         # Drain frame queue  
         while not frame_queue.empty():
@@ -270,6 +273,17 @@ async def reset():
             except queue.Empty:
                 break
         pipeline.reset()
+
+    # Wipe persisted files
+    base_dir = os.path.dirname(__file__)
+    for fname in ['saved_cloud.npz', 'saved_frames.npz']:
+        fpath = os.path.join(base_dir, fname)
+        if os.path.exists(fpath):
+            try:
+                os.remove(fpath)
+                print(f"[Server] Deleted {fname}")
+            except Exception:
+                pass
 
     await broadcast_to_viewers({'type': 'reset'})
     return {"status": "reset_complete"}
@@ -357,6 +371,59 @@ async def stop_video():
     """Stop the video feeder."""
     video_feeder_stop.set()
     return {"status": "stopped"}
+
+
+# ─────────────────────────────────────────
+# Natural Language → Object Prompts (OpenAI)
+# ─────────────────────────────────────────
+class NLParseRequest(BaseModel):
+    text: str
+
+@app.post("/parse-nl-prompt")
+async def parse_nl_prompt(req: NLParseRequest):
+    """
+    Use OpenAI to extract comma-separated object names from a
+    natural language description.
+    """
+    api_key = os.environ.get('OPENAI_API_KEY', '')
+    if not api_key or api_key == 'your-api-key-here':
+        return JSONResponse({"error": "OPENAI_API_KEY not configured in .env"}, status_code=500)
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a helper that extracts physical object names from user descriptions. "
+                        "The user will describe a scene or a task involving physical objects in a room. "
+                        "Extract ONLY the distinct physical object types mentioned or implied. "
+                        "Return them as a comma-separated list of short, simple nouns (1-2 words each). "
+                        "Do NOT include actions, adjectives, or abstract concepts. "
+                        "Example: user says 'I want to figure out where the shelves are so we can place the boxes into the shelves' "
+                        "→ you return: shelves, boxes"
+                    ),
+                },
+                {"role": "user", "content": req.text},
+            ],
+            max_tokens=200,
+            temperature=0,
+        )
+
+        raw = response.choices[0].message.content.strip()
+        # Clean up: split, strip, deduplicate, lowercase
+        objects = list(dict.fromkeys(
+            o.strip().lower() for o in raw.split(',') if o.strip()
+        ))
+        return {"objects": objects, "raw": raw}
+
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # ─────────────────────────────────────────
@@ -541,6 +608,16 @@ async def viewer_ws(ws: WebSocket):
                         except queue.Empty:
                             break
                     pipeline.reset()
+                # Wipe persisted files
+                base_dir = os.path.dirname(__file__)
+                for fname in ['saved_cloud.npz', 'saved_frames.npz']:
+                    fpath = os.path.join(base_dir, fname)
+                    if os.path.exists(fpath):
+                        try:
+                            os.remove(fpath)
+                            print(f"[Server] Deleted {fname}")
+                        except Exception:
+                            pass
                 await broadcast_to_viewers({'type': 'reset'})
 
             elif msg.get('type') == 'get_cloud':

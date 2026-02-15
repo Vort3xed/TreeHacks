@@ -35,6 +35,12 @@
            disabled:opacity-40 disabled:cursor-not-allowed;
   }
 
+  .btn-accent {
+    @apply px-4 py-2 bg-purple-600 text-white font-medium rounded-lg
+           hover:bg-purple-500 active:bg-purple-700 transition-all duration-150
+           disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+
   .stat-label {
     @apply text-xs text-white/50 uppercase tracking-wider font-mono;
   }

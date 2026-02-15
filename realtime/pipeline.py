@@ -385,7 +385,7 @@ class IncrementalPi3:
         }
 
     def save_to_disk(self, path: str = None):
-        """Save the current global point cloud to disk."""
+        """Save the current global point cloud and frame data to disk."""
         if path is None:
             path = os.path.join(os.path.dirname(__file__), 'saved_cloud.npz')
         if not self.global_points:
@@ -398,8 +398,27 @@ class IncrementalPi3:
                             chunks_processed=self.chunks_processed)
         print(f"[Pipeline] Saved {len(all_pts)} points to {path}")
 
+        # Also persist frame_data for object labeling across restarts
+        if self.frame_data:
+            frames_path = os.path.join(os.path.dirname(__file__), 'saved_frames.npz')
+            try:
+                frame_images = [fd['image'] for fd in self.frame_data]
+                frame_points = [fd['point_map'] for fd in self.frame_data]
+                frame_masks = [fd['conf_mask'] for fd in self.frame_data]
+                frame_indices = [fd['frame_idx'] for fd in self.frame_data]
+                np.savez_compressed(
+                    frames_path,
+                    images=np.array(frame_images, dtype=np.uint8),
+                    point_maps=np.array(frame_points, dtype=np.float32),
+                    conf_masks=np.array(frame_masks, dtype=bool),
+                    frame_indices=np.array(frame_indices, dtype=np.int32),
+                )
+                print(f"[Pipeline] Saved {len(self.frame_data)} frames to {frames_path}")
+            except Exception as e:
+                print(f"[Pipeline] Failed to save frame data: {e}")
+
     def load_from_disk(self, path: str = None) -> bool:
-        """Load a saved point cloud. Returns True if loaded."""
+        """Load a saved point cloud and frame data. Returns True if loaded."""
         if path is None:
             path = os.path.join(os.path.dirname(__file__), 'saved_cloud.npz')
         if not os.path.exists(path):
@@ -413,10 +432,33 @@ class IncrementalPi3:
             self.total_points = int(data['total_points'])
             self.chunks_processed = int(data['chunks_processed'])
             print(f"[Pipeline] Loaded {self.total_points} points from {path}")
-            return True
         except Exception as e:
             print(f"[Pipeline] Failed to load cloud: {e}")
             return False
+
+        # Also restore frame_data if available
+        frames_path = os.path.join(os.path.dirname(__file__), 'saved_frames.npz')
+        if os.path.exists(frames_path):
+            try:
+                fdata = np.load(frames_path, allow_pickle=True)
+                images = fdata['images']
+                point_maps = fdata['point_maps']
+                conf_masks = fdata['conf_masks']
+                frame_indices = fdata['frame_indices']
+                self.frame_data = []
+                for i in range(len(images)):
+                    self.frame_data.append({
+                        'frame_idx': int(frame_indices[i]),
+                        'image': images[i],
+                        'point_map': point_maps[i],
+                        'conf_mask': conf_masks[i],
+                    })
+                self._global_frame_idx = int(frame_indices[-1]) + 1 if len(frame_indices) > 0 else 0
+                print(f"[Pipeline] Restored {len(self.frame_data)} cached frames")
+            except Exception as e:
+                print(f"[Pipeline] Failed to load frame data: {e}")
+
+        return True
 
     def reset(self):
         """Clear all state. Model stays loaded."""

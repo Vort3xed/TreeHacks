@@ -63,6 +63,8 @@ const toggleBoxesBtn = document.getElementById('toggle-boxes')!;
 const labelStatus = document.getElementById('label-status')!;
 const labelResults = document.getElementById('label-results')!;
 const labelResultsList = document.getElementById('label-results-list')!;
+const promptModeToggle = document.getElementById('prompt-mode-toggle') as HTMLButtonElement;
+const promptModeLabel = document.getElementById('prompt-mode-label')!;
 
 // Controls
 const connectBtn = document.getElementById('connect-btn') as HTMLButtonElement;
@@ -176,6 +178,7 @@ const labelGroup = new THREE.Group();
 cloudGroup.add(labelGroup); // attach to cloudGroup so orientation transforms apply
 let labeledObjects: LabeledObject[] = [];
 let isLabeling = false;
+let promptMode: 'direct' | 'natural' = 'direct';
 
 // ════════════════════════════════════════
 // Functions
@@ -451,12 +454,10 @@ function renderLabeledObjects(objects: LabeledObject[]) {
     const color = getLabelColor(obj.label);
     const threeColor = new THREE.Color(color);
 
-    // Oriented bounding box from 8 corners
+    // Corners are ordered: bottom face 0-1-2-3 (CCW), top face 4-5-6-7 (CCW)
+    // Edges: bottom 0-1-2-3-0, top 4-5-6-7-4, verticals 0-4 1-5 2-6 3-7
     if (obj.corners && obj.corners.length === 8) {
       const c = obj.corners.map(p => new THREE.Vector3(p[0], p[1], p[2]));
-
-      // Open3D OBB corners are ordered: 0-3 = bottom face, 4-7 = top face
-      // Edges: bottom 0-1-2-3-0, top 4-5-6-7-4, verticals 0-4 1-5 2-6 3-7
       const edgePairs = [
         [0, 1], [1, 2], [2, 3], [3, 0],   // bottom face
         [4, 5], [5, 6], [6, 7], [7, 4],   // top face
@@ -611,15 +612,48 @@ function showFullscreenImage(base64: string, caption: string) {
 async function runLabeling() {
   const promptsStr = labelPromptsInput.value.trim();
   if (!promptsStr) {
-    labelStatus.textContent = 'Enter object names first';
+    labelStatus.textContent = 'Enter object names or description first';
     return;
   }
 
-  const prompts = promptsStr.split(',').map(s => s.trim()).filter(Boolean);
+  labelRunBtn.disabled = true;
+  let prompts: string[];
+
+  // If in natural language mode, first parse with OpenAI
+  if (promptMode === 'natural') {
+    labelStatus.textContent = 'Parsing with AI...';
+    try {
+      const nlResponse = await fetch(`${API_URL}/parse-nl-prompt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: promptsStr }),
+      });
+      if (!nlResponse.ok) {
+        const err = await nlResponse.json();
+        labelStatus.textContent = `AI parse error: ${err.error || nlResponse.statusText}`;
+        labelRunBtn.disabled = false;
+        return;
+      }
+      const nlResult = await nlResponse.json();
+      prompts = nlResult.objects as string[];
+      if (!prompts || prompts.length === 0) {
+        labelStatus.textContent = 'AI could not extract any objects from that description';
+        labelRunBtn.disabled = false;
+        return;
+      }
+      labelStatus.textContent = `AI extracted: ${prompts.join(', ')}. Sending labeling request...`;
+    } catch (err) {
+      labelStatus.textContent = `AI error: ${(err as Error).message}`;
+      labelRunBtn.disabled = false;
+      return;
+    }
+  } else {
+    prompts = promptsStr.split(',').map(s => s.trim()).filter(Boolean);
+  }
+
   const confidence = parseFloat(labelConfidenceInput.value) || 0.3;
   const maxFrames = parseInt(labelMaxFramesInput.value) || 20;
 
-  labelRunBtn.disabled = true;
   labelStatus.textContent = 'Sending labeling request...';
 
   try {
@@ -634,9 +668,7 @@ async function runLabeling() {
     });
 
     if (response.status === 202) {
-      // Fire-and-forget: server accepted, results will arrive via WebSocket
-      labelStatus.textContent = 'Labeling in progress (running in background)...';
-      // Don't re-enable button — will be re-enabled when results arrive via WS
+      labelStatus.textContent = `Labeling: ${prompts.join(', ')} (running in background)...`;
       return;
     }
 
@@ -653,7 +685,7 @@ async function runLabeling() {
       return;
     }
 
-    // Fallback: direct response (shouldn't happen with new server)
+    // Fallback: direct response
     const result = await response.json();
     if (result.objects) {
       labeledObjects = result.objects as LabeledObject[];
@@ -846,6 +878,25 @@ labelToggleBtn.addEventListener('click', () => {
 
 labelRunBtn.addEventListener('click', runLabeling);
 labelClearBtn.addEventListener('click', clearLabels);
+
+// Prompt mode toggle (Direct vs Natural Language)
+promptModeToggle.addEventListener('click', () => {
+  if (promptMode === 'direct') {
+    promptMode = 'natural';
+    promptModeToggle.textContent = 'Natural Language';
+    promptModeToggle.classList.remove('btn-secondary');
+    promptModeToggle.classList.add('btn-accent');
+    promptModeLabel.textContent = 'Describe what you want to find';
+    labelPromptsInput.placeholder = 'e.g. I want to find the shelves so we can place boxes into them...';
+  } else {
+    promptMode = 'direct';
+    promptModeToggle.textContent = 'Direct';
+    promptModeToggle.classList.remove('btn-accent');
+    promptModeToggle.classList.add('btn-secondary');
+    promptModeLabel.textContent = 'Object prompts (comma-separated)';
+    labelPromptsInput.placeholder = 'chair, table, monitor, person...';
+  }
+});
 
 // Debug panel close
 document.getElementById('debug-close-btn')?.addEventListener('click', () => {
