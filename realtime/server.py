@@ -43,11 +43,28 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # ─────────────────────────────────────────
 pipeline: IncrementalPi3 = None
 object_labeler: ObjectLabeler = None
-frame_queue: queue.Queue = queue.Queue(maxsize=60)
+frame_queue: queue.Queue = queue.Queue(maxsize=300)
 connected_viewers: set[WebSocket] = set()
 processing_lock = threading.Lock()
 is_processing = False
 video_feeder_stop = threading.Event()
+
+# ─── Global counters ───
+frames_received_total = 0
+frames_dropped_total = 0
+chunks_sent_total = 0        # chunks whose point‑cloud was broadcast to viewers
+processing_alive = True      # False if the processing thread dies
+_counter_lock = threading.Lock()
+
+def frames_received_total_inc():
+    global frames_received_total
+    with _counter_lock:
+        frames_received_total += 1
+
+def frames_dropped_total_inc():
+    global frames_dropped_total
+    with _counter_lock:
+        frames_dropped_total += 1
 
 
 # ─────────────────────────────────────────
@@ -121,88 +138,171 @@ def encode_point_cloud_binary_fast(points: np.ndarray, colors: np.ndarray, chunk
 # ─────────────────────────────────────────
 # Processing Loop (runs in background thread)
 # ─────────────────────────────────────────
-def processing_loop(loop: asyncio.AbstractEventLoop):
-    """Background thread that pulls frames and runs Pi3X inference."""
-    global is_processing
+def _broadcast_chunk_result(result: dict, loop: asyncio.AbstractEventLoop):
+    """Helper: encode & broadcast a single chunk result to all viewers."""
+    if result is None or len(result['points']) == 0:
+        if result is not None:
+            skip_msg = {
+                'type': 'chunk_skipped',
+                'chunk_id': result['chunk_id'],
+                'total_points': result['total_points'],
+                'reason': 'No valid points produced',
+            }
+            asyncio.run_coroutine_threadsafe(broadcast_to_viewers(skip_msg), loop)
+        return
 
-    print("[Server] Processing loop started")
+    # Downsample for streaming if needed
+    pts = result['points']
+    cols = result['colors']
+    if len(pts) > 100_000:
+        s = len(pts) // 100_000
+        pts = pts[::s]
+        cols = cols[::s]
+
+    binary_data = encode_point_cloud_binary_fast(
+        pts, cols,
+        result['chunk_id'],
+        result['total_points'],
+        result.get('elapsed', 0.0)
+    )
+    asyncio.run_coroutine_threadsafe(broadcast_binary(binary_data), loop)
+
+    done_msg = {
+        'type': 'chunk_done',
+        'chunk_id': result['chunk_id'],
+        'new_points': len(result['points']),
+        'total_points': result['total_points'],
+        'elapsed': result.get('elapsed', 0.0),
+    }
+    asyncio.run_coroutine_threadsafe(broadcast_to_viewers(done_msg), loop)
+
+
+def processing_loop(loop: asyncio.AbstractEventLoop):
+    """Background thread that pulls frames and runs Pi3X inference.
+
+    In parallel mode (num_workers > 1), uses an *accumulation window*:
+    after the first chunk becomes ready, keeps pulling frames from the
+    queue for a short time so that multiple chunks can be batched together
+    and processed on the GPU in parallel.
+    """
+    global is_processing, processing_alive, chunks_sent_total
+
+    use_parallel = pipeline.num_workers > 1
+    ACCUMULATION_WINDOW = 3.0 if use_parallel else 0.0
+    stride = pipeline.chunk_size - pipeline.overlap
+
+    mode_str = (f"parallel ×{pipeline.num_workers}, accum {ACCUMULATION_WINDOW}s"
+                if use_parallel else "sequential")
+    print(f"[Server] Processing loop started ({mode_str})")
+
+    def _count_available_chunks() -> int:
+        buf = len(pipeline.frame_buffer)
+        if pipeline.is_first_chunk:
+            if buf < pipeline.chunk_size:
+                return 0
+            return 1 + (buf - pipeline.chunk_size) // stride
+        else:
+            return buf // stride
+
+    def _send_status():
+        remaining = pipeline.frames_until_ready()
+        status_msg = {
+            'type': 'status',
+            'frames_buffered': len(pipeline.frame_buffer),
+            'frames_needed': remaining,
+            'total_points': pipeline.total_points,
+            'chunks_processed': pipeline.chunks_processed,
+            'frames_received': frames_received_total,
+            'frames_dropped': frames_dropped_total,
+            'chunks_sent': chunks_sent_total,
+            'queue_size': frame_queue.qsize(),
+            'processing_alive': processing_alive,
+        }
+        asyncio.run_coroutine_threadsafe(broadcast_to_viewers(status_msg), loop)
 
     while True:
         try:
-            frame_bgr = frame_queue.get(timeout=1.0)
-        except queue.Empty:
-            continue
+            # ── Phase 1: get at least one new frame ────────────────
+            try:
+                frame_bgr = frame_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
 
-        with processing_lock:
-            ready = pipeline.add_frame(frame_bgr)
+            with processing_lock:
+                pipeline.add_frame(frame_bgr)
 
-            remaining = pipeline.frames_until_ready()
-            status_msg = {
-                'type': 'status',
-                'frames_buffered': len(pipeline.frame_buffer),
-                'frames_needed': remaining,
-                'total_points': pipeline.total_points,
-                'chunks_processed': pipeline.chunks_processed,
-            }
-            asyncio.run_coroutine_threadsafe(broadcast_to_viewers(status_msg), loop)
+                # Drain anything else that already arrived
+                while not frame_queue.empty():
+                    try:
+                        pipeline.add_frame(frame_queue.get_nowait())
+                    except queue.Empty:
+                        break
 
-            if ready:
+                _send_status()
+
+                remaining = pipeline.frames_until_ready()
+                if remaining > 0:
+                    continue
+
+                # ── Phase 2: at least 1 chunk is ready ─────────────
                 is_processing = True
+
+                if use_parallel:
+                    t_accum_start = time.time()
+                    last_frame_time = time.time()
+
+                    while time.time() - t_accum_start < ACCUMULATION_WINDOW:
+                        n_chunks = _count_available_chunks()
+                        if n_chunks >= pipeline.num_workers:
+                            break
+                        try:
+                            extra = frame_queue.get(timeout=0.25)
+                            pipeline.add_frame(extra)
+                            last_frame_time = time.time()
+                        except queue.Empty:
+                            if time.time() - last_frame_time > 0.6:
+                                break
+
+                    n_final = _count_available_chunks()
+                    accum_elapsed = time.time() - t_accum_start
+                    print(f"[Server] Accumulated {n_final} chunk(s) in "
+                          f"{accum_elapsed:.1f}s (buffer={len(pipeline.frame_buffer)})")
+
                 processing_msg = {'type': 'processing', 'chunk_id': pipeline.chunks_processed}
                 asyncio.run_coroutine_threadsafe(broadcast_to_viewers(processing_msg), loop)
 
+                # ── Phase 3: inference ─────────────────────────────
                 try:
-                    result = pipeline.process_chunk()
+                    if use_parallel:
+                        results = pipeline.process_chunks_parallel()
+                        for r in results:
+                            _broadcast_chunk_result(r, loop)
+                            chunks_sent_total += 1
+                    else:
+                        result = pipeline.process_chunk()
+                        _broadcast_chunk_result(result, loop)
+                        chunks_sent_total += 1
+
                 except Exception as e:
-                    print(f"[Server] ERROR in process_chunk: {e}")
+                    print(f"[Server] ERROR in processing: {e}")
                     import traceback; traceback.print_exc()
-                    result = None
-                    # Send error to viewers
-                    err_msg = {'type': 'chunk_error', 'error': str(e), 'chunk_id': pipeline.chunks_processed}
+                    err_msg = {'type': 'chunk_error', 'error': str(e),
+                               'chunk_id': pipeline.chunks_processed}
                     asyncio.run_coroutine_threadsafe(broadcast_to_viewers(err_msg), loop)
 
                 is_processing = False
+                _send_status()  # immediate status update after processing
 
-                if result is not None and len(result['points']) > 0:
-                    # Auto-save to disk
-                    try:
-                        pipeline.save_to_disk()
-                    except Exception:
-                        pass
+        except Exception as e:
+            # Protect the processing thread from dying
+            print(f"[Server] FATAL error in processing loop: {e}")
+            import traceback; traceback.print_exc()
+            is_processing = False
+            time.sleep(1)  # avoid tight error loop
 
-                    # Downsample for streaming if needed
-                    pts = result['points']
-                    cols = result['colors']
-                    if len(pts) > 100_000:
-                        stride = len(pts) // 100_000
-                        pts = pts[::stride]
-                        cols = cols[::stride]
-
-                    binary_data = encode_point_cloud_binary_fast(
-                        pts, cols,
-                        result['chunk_id'],
-                        result['total_points'],
-                        result['elapsed']
-                    )
-                    asyncio.run_coroutine_threadsafe(broadcast_binary(binary_data), loop)
-
-                    done_msg = {
-                        'type': 'chunk_done',
-                        'chunk_id': result['chunk_id'],
-                        'new_points': len(result['points']),
-                        'total_points': result['total_points'],
-                        'elapsed': result['elapsed'],
-                    }
-                    asyncio.run_coroutine_threadsafe(broadcast_to_viewers(done_msg), loop)
-                elif result is not None:
-                    # Chunk produced 0 valid points — notify viewer
-                    skip_msg = {
-                        'type': 'chunk_skipped',
-                        'chunk_id': result['chunk_id'],
-                        'total_points': result['total_points'],
-                        'reason': 'No valid points produced (scene may have changed dramatically)',
-                    }
-                    asyncio.run_coroutine_threadsafe(broadcast_to_viewers(skip_msg), loop)
+    # Should never reach here, but just in case
+    processing_alive = False
+    print("[Server] ⚠️  Processing loop EXITED")
 
 
 # ─────────────────────────────────────────
@@ -238,8 +338,9 @@ def feed_video_file(video_path: str, target_fps: float = 2.0, fast: bool = False
         if not frame_queue.full():
             frame_queue.put(frame)
             fed += 1
+            frames_received_total_inc()
         else:
-            pass  # drop frame (backpressure)
+            frames_dropped_total_inc()
 
         if delay > 0:
             time.sleep(delay)
@@ -260,6 +361,50 @@ async def health():
         "total_points": pipeline.total_points if pipeline else 0,
         "chunks_processed": pipeline.chunks_processed if pipeline else 0,
     }
+
+
+@app.get("/stats")
+async def stats():
+    """Return detailed pipeline stats for the frontend."""
+    return {
+        "frames_received": frames_received_total,
+        "frames_dropped": frames_dropped_total,
+        "frames_buffered": len(pipeline.frame_buffer) if pipeline else 0,
+        "queue_size": frame_queue.qsize(),
+        "queue_max": frame_queue.maxsize,
+        "chunks_processed": pipeline.chunks_processed if pipeline else 0,
+        "chunks_sent": chunks_sent_total,
+        "total_points": pipeline.total_points if pipeline else 0,
+        "is_processing": is_processing,
+        "processing_alive": processing_alive,
+        "workers": pipeline.num_workers if pipeline else 1,
+    }
+
+
+@app.post("/save")
+async def save_state():
+    """Manually save point cloud and frame data to disk."""
+    if not pipeline:
+        return JSONResponse(status_code=400, content={"error": "Pipeline not initialized"})
+    if not pipeline.global_points and not pipeline.frame_data:
+        return JSONResponse(status_code=400, content={
+            "error": "No data to save",
+            "total_points": pipeline.total_points,
+            "global_points_len": len(pipeline.global_points),
+            "frame_data_len": len(pipeline.frame_data),
+        })
+
+    try:
+        with processing_lock:
+            pipeline.save_to_disk()
+        return {
+            "status": "saved",
+            "total_points": pipeline.total_points,
+            "chunks_processed": pipeline.chunks_processed,
+            "frames_saved": len(pipeline.frame_data),
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @app.post("/reset")
@@ -655,15 +800,30 @@ async def sender_ws(ws: WebSocket):
                 img_arr = np.frombuffer(img_bytes, dtype=np.uint8)
                 frame = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
 
-                if frame is not None and not frame_queue.full():
-                    frame_queue.put(frame)
+                if frame is not None:
                     frames_received += 1
+                    try:
+                        frame_queue.put_nowait(frame)
+                    except queue.Full:
+                        # Drop oldest frame to make room
+                        try:
+                            frame_queue.get_nowait()
+                            frames_dropped_total_inc()
+                        except queue.Empty:
+                            pass
+                        try:
+                            frame_queue.put_nowait(frame)
+                        except queue.Full:
+                            frames_dropped_total_inc()
+                    frames_received_total_inc()
 
                 await ws.send_json({
                     'type': 'frame_ack',
                     'frame': frames_received,
                     'queue_size': frame_queue.qsize(),
                     'queue_full': frame_queue.full(),
+                    'total_received': frames_received_total,
+                    'total_dropped': frames_dropped_total,
                 })
 
     except WebSocketDisconnect:
@@ -715,12 +875,22 @@ if __name__ == '__main__':
     parser.add_argument('--fast', action='store_true', help='Feed video as fast as possible')
     parser.add_argument('--chunk-size', type=int, default=16, help='Chunk size')
     parser.add_argument('--overlap', type=int, default=6, help='Overlap size')
+    parser.add_argument('--workers', type=int, default=0,
+                        help='Parallel GPU workers (0=auto-detect from GPU memory)')
     args = parser.parse_args()
 
     # Initialize pipeline
-    pipeline = IncrementalPi3(device='cuda' if torch.cuda.is_available() else 'cpu')
+    pipeline = IncrementalPi3(device='cuda' if torch.cuda.is_available() else 'cpu',
+                              num_workers=1)  # set workers after model load
     pipeline.load_model(ckpt=args.ckpt)
     pipeline.configure(chunk_size=args.chunk_size, overlap=args.overlap)
+
+    # Determine worker count (auto-detect needs model loaded to know memory usage)
+    if args.workers == 0:
+        pipeline.num_workers = pipeline.auto_detect_workers()
+    else:
+        pipeline.num_workers = max(1, args.workers)
+    print(f"[Server] GPU workers: {pipeline.num_workers}")
 
     # Try to load persisted point cloud
     try:
@@ -757,6 +927,8 @@ if __name__ == '__main__':
     print(f"  GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
     print(f"  Port: {args.port}")
     print(f"  Chunk: {pipeline.chunk_size} frames, Overlap: {pipeline.overlap}")
+    print(f"  Workers: {pipeline.num_workers} "
+          f"({'auto-detected' if args.workers == 0 else 'manual'})")
     if args.video:
         print(f"  Video: {args.video} ({args.video_fps} fps, {'fast' if args.fast else 'realtime'})")
     print(f"  Frontend: https://0.0.0.0:{args.port}")

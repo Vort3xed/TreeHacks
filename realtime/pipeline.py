@@ -10,6 +10,8 @@ import numpy as np
 import cv2
 import time
 import traceback
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 from typing import Optional
 
@@ -61,10 +63,14 @@ class IncrementalPi3:
                 # delta has new points + colors
     """
 
-    def __init__(self, device: str = 'cuda'):
+    def __init__(self, device: str = 'cuda', num_workers: int = 1):
         self.device = torch.device(device)
         self.model: Optional[Pi3X] = None
         self.dtype = torch.bfloat16
+
+        # Parallel processing
+        self.num_workers = num_workers
+        self._cuda_streams: list[torch.cuda.Stream] = []
 
         # Configuration (hot-reconfigurable)
         self.chunk_size = 16
@@ -365,6 +371,369 @@ class IncrementalPi3:
             'camera_poses': chunk_poses,
         }
 
+    # ─── Parallel chunk processing ───────────────────────────────
+
+    def auto_detect_workers(self) -> int:
+        """Estimate how many concurrent chunk inferences fit in GPU memory."""
+        if not torch.cuda.is_available():
+            return 1
+        total_mem = torch.cuda.get_device_properties(0).total_memory
+        used_mem = torch.cuda.memory_allocated(0)
+        # Reserve model weights + 2GB headroom
+        available = total_mem - used_mem - 2 * (1024 ** 3)
+        # Each chunk inference uses ~5.5GB activation memory
+        per_chunk = int(5.5 * (1024 ** 3))
+        n = max(1, int(available / per_chunk))
+        return min(n, 8)  # cap at 8
+
+    def _ensure_streams(self, n: int):
+        """Lazily create CUDA streams."""
+        while len(self._cuda_streams) < n:
+            self._cuda_streams.append(torch.cuda.Stream(device=self.device))
+
+    @torch.no_grad()
+    def process_chunks_parallel(self) -> list[dict]:
+        """
+        Process all available frames using parallel GPU inference.
+
+        Multiple chunks run concurrently on separate CUDA streams
+        (sharing model weights), then are stitched sequentially via
+        Sim3 alignment.
+
+        Returns list of chunk result dicts (same format as process_chunk).
+        Falls back to sequential single-chunk processing if only 1 chunk
+        is available or num_workers == 1.
+        """
+        if self.model is None:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+
+        stride = self.chunk_size - self.overlap
+        if stride <= 0:
+            r = self.process_chunk()
+            return [r] if r else []
+
+        # ── Determine how many chunks we can form ──
+        buf_len = len(self.frame_buffer)
+        was_first = self.is_first_chunk
+
+        if was_first:
+            if buf_len < self.chunk_size:
+                return []
+            max_chunks = 1 + (buf_len - self.chunk_size) // stride
+        else:
+            if buf_len < stride:
+                return []
+            max_chunks = buf_len // stride
+
+        n_chunks = min(max_chunks, self.num_workers)
+        if n_chunks <= 1:
+            r = self.process_chunk()
+            return [r] if r else []
+
+        t_total = time.time()
+        self._ensure_streams(n_chunks)
+
+        print(f"[Pipeline] ⚡ Parallel: {n_chunks} chunks × {self.chunk_size} frames "
+              f"({buf_len} buffered, {self.num_workers} workers)")
+
+        # ── Build chunk frame lists ──
+        chunk_frame_lists: list[list[torch.Tensor]] = []
+
+        for ci in range(n_chunks):
+            if was_first:
+                # All chunks are independent
+                start = ci * stride
+                end = start + self.chunk_size
+                frames = list(self.frame_buffer[start:end])
+            else:
+                if ci == 0:
+                    # First chunk uses overlap from previous session
+                    overlap_imgs = [self._prev_overlap_imgs[i]
+                                    for i in range(self._prev_overlap_imgs.shape[0])]
+                    new_frames = list(self.frame_buffer[:stride])
+                    frames = overlap_imgs + new_frames
+                else:
+                    # Independent chunk (no prior injection)
+                    start = ci * stride - self.overlap
+                    end = start + self.chunk_size
+                    frames = list(self.frame_buffer[start:end])
+
+            if len(frames) < self.chunk_size:
+                break
+            chunk_frame_lists.append(frames)
+
+        n_chunks = len(chunk_frame_lists)
+        if n_chunks <= 1:
+            r = self.process_chunk()
+            return [r] if r else []
+
+        # ── Parallel model inference on CUDA streams ──
+        raw_preds: list[Optional[dict]] = [None] * n_chunks
+        infer_errors: list[Optional[str]] = [None] * n_chunks
+
+        def _infer_worker(ci: int):
+            """Run model forward pass on a dedicated CUDA stream."""
+            stream = self._cuda_streams[ci]
+            try:
+                with torch.cuda.stream(stream):
+                    imgs = torch.stack(chunk_frame_lists[ci]).unsqueeze(0).to(self.device)
+                    B, T, C, H, W = imgs.shape
+
+                    # Build model kwargs — only ci=0 in continuation mode gets priors
+                    model_kwargs: dict = {'with_prior': False}
+
+                    if ci == 0 and not was_first and self._prev_overlap_poses is not None:
+                        ov = self.overlap
+                        if 'pose' in self.inject_conditions:
+                            pp = torch.eye(4, device=self.device).repeat(B, T, 1, 1)
+                            pp[:, :ov] = self._prev_overlap_poses.to(self.device)
+                            mp = torch.zeros((B, T), dtype=torch.bool, device=self.device)
+                            mp[:, :ov] = True
+                            model_kwargs['poses'] = pp
+                            model_kwargs['mask_add_pose'] = mp
+                            model_kwargs['with_prior'] = True
+
+                        if 'depth' in self.inject_conditions and self._prev_overlap_depth is not None:
+                            pd = torch.zeros((B, T, H, W), device=self.device)
+                            pd[:, :ov] = self._prev_overlap_depth.to(self.device)
+                            md = torch.zeros((B, T), dtype=torch.bool, device=self.device)
+                            md[:, :ov] = True
+                            if self._prev_overlap_conf is not None:
+                                valid = self._prev_overlap_conf.to(self.device) > self.conf_thre
+                                pd[:, :ov][~valid] = 0
+                            model_kwargs['depths'] = pd
+                            model_kwargs['mask_add_depth'] = md
+                            model_kwargs['with_prior'] = True
+
+                        if 'ray' in self.inject_conditions and self._prev_overlap_rays is not None:
+                            pr = torch.zeros((B, T, H, W, 3), device=self.device)
+                            pr[:, :ov] = self._prev_overlap_rays.to(self.device)
+                            mr = torch.zeros((B, T), dtype=torch.bool, device=self.device)
+                            mr[:, :ov] = True
+                            model_kwargs['rays'] = pr
+                            model_kwargs['mask_add_ray'] = mr
+                            model_kwargs['with_prior'] = True
+
+                    # Forward pass
+                    with torch.amp.autocast('cuda', dtype=self.dtype):
+                        pred = self.model(imgs, **model_kwargs)
+
+                    # Move results to CPU immediately to free GPU activation memory
+                    result = {
+                        'points': pred['points'].cpu(),
+                        'camera_poses': pred['camera_poses'].cpu(),
+                        'conf': torch.sigmoid(pred['conf'])[..., 0].cpu(),
+                        'local_depth': pred['local_points'][..., 2].cpu(),
+                        'rays': pred['rays'].cpu(),
+                        'chunk_imgs': imgs.cpu(),
+                    }
+
+                    # Cleanup GPU memory for this stream
+                    del pred, imgs
+                    for k in list(model_kwargs.keys()):
+                        if k != 'with_prior':
+                            del model_kwargs[k]
+
+                    raw_preds[ci] = result
+
+            except Exception as e:
+                infer_errors[ci] = str(e)
+                traceback.print_exc()
+
+        # Launch all workers
+        threads: list[threading.Thread] = []
+        for ci in range(n_chunks):
+            t = threading.Thread(target=_infer_worker, args=(ci,), daemon=True)
+            t.start()
+            threads.append(t)
+
+        for t in threads:
+            t.join()
+
+        # Synchronize all streams
+        for ci in range(n_chunks):
+            self._cuda_streams[ci].synchronize()
+
+        torch.cuda.empty_cache()
+
+        t_infer = time.time() - t_total
+        ok_count = sum(1 for r in raw_preds if r is not None)
+        print(f"[Pipeline] Parallel inference: {ok_count}/{n_chunks} succeeded in {t_infer:.2f}s "
+              f"(~{t_infer/max(ok_count,1):.2f}s effective per chunk)")
+
+        # ── Sequential Sim3 stitching ──
+        results: list[dict] = []
+
+        for ci in range(n_chunks):
+            raw = raw_preds[ci]
+            if raw is None:
+                print(f"[Pipeline] Skipping failed chunk {ci}: {infer_errors[ci]}")
+                continue
+
+            t_stitch = time.time()
+            result = self._stitch_chunk(raw, is_first=(was_first and ci == 0))
+
+            if result is not None:
+                results.append(result)
+
+            elapsed_stitch = time.time() - t_stitch
+            if result:
+                print(f"[Pipeline] Chunk {result['chunk_id']}: "
+                      f"{len(result['points'])} pts, stitch {elapsed_stitch:.3f}s")
+
+        # ── Consume frames from buffer ──
+        if was_first:
+            consumed = (n_chunks - 1) * stride + self.chunk_size
+        else:
+            consumed = n_chunks * stride
+        self.frame_buffer = self.frame_buffer[consumed:]
+
+        # Auto-save
+        if results:
+            try:
+                self.save_to_disk()
+            except Exception:
+                pass
+
+        t_elapsed = time.time() - t_total
+        total_new_pts = sum(len(r['points']) for r in results)
+        print(f"[Pipeline] ⚡ Parallel complete: {len(results)} chunks, "
+              f"{total_new_pts:,} new points, {t_elapsed:.2f}s total "
+              f"(vs ~{t_infer/max(ok_count,1) * n_chunks:.1f}s sequential)")
+
+        return results
+
+    def _stitch_chunk(self, raw: dict, is_first: bool) -> Optional[dict]:
+        """
+        Take raw inference output (on CPU) and perform Sim3 alignment,
+        point extraction, filtering, and accumulation.
+        """
+        curr_pts = raw['points'].to(self.device)         # (1, T, H, W, 3)
+        curr_poses = raw['camera_poses'].to(self.device)  # (1, T, 4, 4)
+        curr_conf = raw['conf']                            # (1, T, H, W) CPU
+        curr_local_depth = raw['local_depth']              # (1, T, H, W) CPU
+        curr_rays = raw['rays']                            # (1, T, H, W, 3) CPU
+        chunk_imgs = raw['chunk_imgs']                     # (1, T, 3, H, W) CPU
+
+        B, T, H, W, _ = curr_pts.shape
+
+        # Edge filtering (on GPU)
+        local_depth_gpu = curr_local_depth.to(self.device)
+        edge = depth_edge(local_depth_gpu, rtol=0.03)
+        curr_conf_gpu = curr_conf.to(self.device)
+        curr_conf_gpu[edge] = 0
+        curr_mask = curr_conf_gpu > self.conf_thre
+
+        # Fallback if too few valid points
+        if curr_mask.sum() < 10:
+            flat_conf = curr_conf_gpu.view(B, T, -1)
+            k = int(flat_conf.shape[-1] * 0.1)
+            topk_vals, _ = torch.topk(flat_conf, k, dim=-1)
+            min_vals = topk_vals[..., -1].unsqueeze(-1).unsqueeze(-1)
+            curr_mask = curr_conf_gpu >= min_vals
+
+        # Sim3 alignment
+        if is_first:
+            aligned_pts = curr_pts
+            aligned_poses = curr_poses
+        else:
+            ov = self.overlap
+            src_pts = curr_pts[:, :ov]
+            src_mask = curr_mask[:, :ov]
+            tgt_pts = self._prev_overlap_pts.to(self.device)
+            tgt_mask = self._prev_overlap_mask.to(self.device)
+
+            transform = self._compute_sim3_umeyama_masked(
+                src_pts, tgt_pts, src_mask, tgt_mask)
+
+            sim3_scale = torch.det(transform[:, :3, :3]).abs().pow(1.0 / 3.0)
+            sim3_nan = torch.isnan(transform).any() or torch.isinf(transform).any()
+            if sim3_nan or sim3_scale.item() < 0.01 or sim3_scale.item() > 100.0:
+                print(f"[Pipeline] WARNING: Sim3 failed (scale={sim3_scale.item():.4f}). Using identity.")
+                transform = torch.eye(4, device=self.device).unsqueeze(0)
+
+            aligned_pts = self._apply_sim3_to_points(curr_pts, transform)
+            aligned_poses = self._apply_sim3_to_poses(curr_poses, transform)
+
+        # Extract new points (skip overlap for non-first chunks)
+        if is_first:
+            new_pts = aligned_pts[0]
+            new_conf_mask = curr_mask[0]
+            new_imgs = chunk_imgs[0]
+        else:
+            ov = self.overlap
+            new_pts = aligned_pts[0, ov:]
+            new_conf_mask = curr_mask[0, ov:]
+            new_imgs = chunk_imgs[0, ov:]
+
+        # Store per-frame data for object labeling
+        n_new = new_pts.shape[0]
+        for fi in range(n_new):
+            frame_img = (new_imgs[fi].permute(1, 2, 0) * 255).byte().cpu().numpy()
+            frame_pts_np = new_pts[fi].cpu().numpy().astype(np.float32)
+            frame_mask_np = new_conf_mask[fi].cpu().numpy()
+            self.frame_data.append({
+                'frame_idx': self._global_frame_idx,
+                'image': frame_img,
+                'point_map': frame_pts_np,
+                'conf_mask': frame_mask_np,
+            })
+            self._global_frame_idx += 1
+
+        # Extract valid points and colors
+        new_conf_cpu = new_conf_mask.cpu()
+        valid_pts = new_pts[new_conf_mask].cpu().numpy()
+        valid_colors = (new_imgs.permute(0, 2, 3, 1)[new_conf_cpu] * 255).byte().cpu().numpy()
+
+        # Filter NaN/Inf
+        finite_mask = np.isfinite(valid_pts).all(axis=1)
+        if not finite_mask.all():
+            n_bad = (~finite_mask).sum()
+            print(f"[Pipeline] Filtered {n_bad} NaN/Inf points")
+            valid_pts = valid_pts[finite_mask]
+            valid_colors = valid_colors[finite_mask]
+
+        # Filter outliers (> 50 units from median)
+        if len(valid_pts) > 100:
+            median = np.median(valid_pts, axis=0)
+            dists = np.linalg.norm(valid_pts - median, axis=1)
+            inlier_mask = dists < 50.0
+            n_outlier = (~inlier_mask).sum()
+            if n_outlier > 0:
+                valid_pts = valid_pts[inlier_mask]
+                valid_colors = valid_colors[inlier_mask]
+
+        # Update overlap state for the next chunk
+        ov = self.overlap
+        self._prev_overlap_imgs = chunk_imgs[0, -ov:]
+        self._prev_overlap_pts = aligned_pts[:, -ov:].cpu()
+        self._prev_overlap_mask = curr_mask[:, -ov:].cpu()
+        self._prev_overlap_poses = aligned_poses[:, -ov:].cpu()
+        self._prev_overlap_depth = local_depth_gpu[:, -ov:].cpu()
+        self._prev_overlap_conf = curr_conf_gpu[:, -ov:].cpu()
+        self._prev_overlap_rays = curr_rays[:, -ov:]
+
+        # Accumulate globally
+        self.global_points.append(valid_pts)
+        self.global_colors.append(valid_colors)
+        self.total_points += len(valid_pts)
+        self.chunks_processed += 1
+        self.is_first_chunk = False
+
+        # Cleanup
+        del curr_pts, curr_poses, aligned_pts, aligned_poses
+        del local_depth_gpu, curr_conf_gpu
+
+        elapsed = time.time()  # just for the result dict
+
+        return {
+            'points': valid_pts,
+            'colors': valid_colors,
+            'chunk_id': self.chunks_processed - 1,
+            'total_points': self.total_points,
+            'elapsed': 0.0,  # set by caller
+        }
+
     def get_global_cloud(self, max_points: int = 100_000) -> dict:
         """Get the full accumulated cloud, downsampled if needed."""
         if not self.global_points:
@@ -388,15 +757,20 @@ class IncrementalPi3:
         """Save the current global point cloud and frame data to disk."""
         if path is None:
             path = os.path.join(os.path.dirname(__file__), 'saved_cloud.npz')
-        if not self.global_points:
-            print("[Pipeline] No points to save")
-            return
-        all_pts = np.concatenate(self.global_points, axis=0).astype(np.float32)
-        all_cols = np.concatenate(self.global_colors, axis=0).astype(np.uint8)
-        np.savez_compressed(path, points=all_pts, colors=all_cols,
-                            total_points=self.total_points,
-                            chunks_processed=self.chunks_processed)
-        print(f"[Pipeline] Saved {len(all_pts)} points to {path}")
+
+        saved_pts = False
+        saved_frames = False
+
+        if self.global_points:
+            all_pts = np.concatenate(self.global_points, axis=0).astype(np.float32)
+            all_cols = np.concatenate(self.global_colors, axis=0).astype(np.uint8)
+            np.savez_compressed(path, points=all_pts, colors=all_cols,
+                                total_points=self.total_points,
+                                chunks_processed=self.chunks_processed)
+            print(f"[Pipeline] Saved {len(all_pts)} points to {path}")
+            saved_pts = True
+        else:
+            print("[Pipeline] No points to save (global_points is empty)")
 
         # Also persist frame_data for object labeling across restarts
         if self.frame_data:
@@ -414,8 +788,14 @@ class IncrementalPi3:
                     frame_indices=np.array(frame_indices, dtype=np.int32),
                 )
                 print(f"[Pipeline] Saved {len(self.frame_data)} frames to {frames_path}")
+                saved_frames = True
             except Exception as e:
                 print(f"[Pipeline] Failed to save frame data: {e}")
+        else:
+            print("[Pipeline] No frame data to save")
+
+        if not saved_pts and not saved_frames:
+            raise ValueError("Nothing to save: no points and no frame data")
 
     def load_from_disk(self, path: str = None) -> bool:
         """Load a saved point cloud and frame data. Returns True if loaded."""

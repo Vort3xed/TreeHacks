@@ -11,8 +11,9 @@ const SERVER_PORT = '5000';
 const WS_URL = `wss://${SERVER_HOST}:${SERVER_PORT}/ws/viewer`;
 const API_URL = `https://${SERVER_HOST}:${SERVER_PORT}`;
 
-// How many points we pre-allocate in the buffer geometry
-const MAX_POINTS = 2_000_000;
+// How many points we pre-allocate in the buffer geometry (grows dynamically)
+const INITIAL_POINTS = 2_000_000;
+const MAX_POINTS_HARD = 800_000_000; // absolute safety cap (800M)
 
 // ════════════════════════════════════════
 // DOM
@@ -24,6 +25,11 @@ const statPoints = document.getElementById('stat-points')!;
 const statChunks = document.getElementById('stat-chunks')!;
 const statBuffered = document.getElementById('stat-buffered')!;
 const statElapsed = document.getElementById('stat-elapsed')!;
+const statFramesRecv = document.getElementById('stat-frames-recv')!;
+const statFramesDropped = document.getElementById('stat-frames-dropped')!;
+const statQueue = document.getElementById('stat-queue')!;
+const statChunksSent = document.getElementById('stat-chunks-sent')!;
+const statEngine = document.getElementById('stat-engine')!;
 const progressContainer = document.getElementById('progress-container')!;
 const progressBar = document.getElementById('progress-bar')!;
 
@@ -70,6 +76,7 @@ const promptModeLabel = document.getElementById('prompt-mode-label')!;
 const connectBtn = document.getElementById('connect-btn') as HTMLButtonElement;
 const disconnectBtn = document.getElementById('disconnect-btn') as HTMLButtonElement;
 const resetBtn = document.getElementById('reset-btn') as HTMLButtonElement;
+const saveStateBtn = document.getElementById('save-state-btn') as HTMLButtonElement;
 const resetViewBtn = document.getElementById('reset-view-btn')!;
 
 // ════════════════════════════════════════
@@ -114,17 +121,17 @@ scene.add(axesHelper);
 scene.add(new THREE.AmbientLight(0xffffff, 0.5));
 
 // ════════════════════════════════════════
-// Point Cloud
+// Point Cloud (dynamic growing buffer)
 // ════════════════════════════════════════
 
-// Pre-allocate buffers
-const positions = new Float32Array(MAX_POINTS * 3);
-const colors = new Float32Array(MAX_POINTS * 3);
+let bufferCapacity = INITIAL_POINTS;          // current allocated capacity in points
+let positions = new Float32Array(bufferCapacity * 3);
+let colorsArr = new Float32Array(bufferCapacity * 3);
 let pointCount = 0;
 
 const geometry = new THREE.BufferGeometry();
 geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+geometry.setAttribute('color', new THREE.BufferAttribute(colorsArr, 3));
 geometry.setDrawRange(0, 0);
 
 const material = new THREE.PointsMaterial({
@@ -194,10 +201,51 @@ function setStatus(state: 'connected' | 'disconnected' | 'connecting' | 'error',
   }[state]);
 }
 
-function addPoints(pts: Float32Array, cols: Uint8Array, n: number) {
-  if (pointCount + n > MAX_POINTS) {
-    console.warn(`Point buffer full (${MAX_POINTS}). Skipping new points.`);
+/**
+ * Grow the buffer geometry to hold at least `needed` total points.
+ * Allocates a new buffer 2× the required size, copies existing data, and
+ * swaps the geometry attributes.
+ */
+function growBufferIfNeeded(needed: number) {
+  if (needed <= bufferCapacity) return;
+  if (needed > MAX_POINTS_HARD) {
+    console.warn(`Hit hard cap of ${(MAX_POINTS_HARD / 1e6).toFixed(0)}M points — not allocating more.`);
     return;
+  }
+
+  // Double until large enough, but stay under hard cap
+  let newCap = bufferCapacity;
+  while (newCap < needed) newCap *= 2;
+  newCap = Math.min(newCap, MAX_POINTS_HARD);
+
+  console.log(`[Viewer] Growing point buffer: ${(bufferCapacity / 1e6).toFixed(1)}M → ${(newCap / 1e6).toFixed(1)}M points`);
+
+  const newPos = new Float32Array(newCap * 3);
+  const newCol = new Float32Array(newCap * 3);
+
+  // Copy existing data
+  newPos.set(positions.subarray(0, pointCount * 3));
+  newCol.set(colorsArr.subarray(0, pointCount * 3));
+
+  positions = newPos;
+  colorsArr = newCol;
+  bufferCapacity = newCap;
+
+  // Swap attributes on the geometry
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(colorsArr, 3));
+}
+
+function addPoints(pts: Float32Array, cols: Uint8Array, n: number) {
+  const needed = pointCount + n;
+
+  if (needed > bufferCapacity) {
+    growBufferIfNeeded(needed);
+    // After grow, check if we're still over (hit hard cap)
+    if (needed > bufferCapacity) {
+      console.warn(`Cannot add ${n} points — at hard cap (${(bufferCapacity / 1e6).toFixed(0)}M).`);
+      return;
+    }
   }
 
   // Copy position data
@@ -205,7 +253,7 @@ function addPoints(pts: Float32Array, cols: Uint8Array, n: number) {
 
   // Convert uint8 colors to float [0, 1]
   for (let i = 0; i < n * 3; i++) {
-    colors[pointCount * 3 + i] = cols[i] / 255;
+    colorsArr[pointCount * 3 + i] = cols[i] / 255;
   }
 
   pointCount += n;
@@ -222,6 +270,15 @@ function addPoints(pts: Float32Array, cols: Uint8Array, n: number) {
 function clearPoints() {
   pointCount = 0;
   geometry.setDrawRange(0, 0);
+
+  // Shrink back to initial capacity to free memory
+  if (bufferCapacity > INITIAL_POINTS) {
+    bufferCapacity = INITIAL_POINTS;
+    positions = new Float32Array(bufferCapacity * 3);
+    colorsArr = new Float32Array(bufferCapacity * 3);
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colorsArr, 3));
+  }
 }
 
 function parseBinaryPointCloud(buffer: ArrayBuffer) {
@@ -249,6 +306,24 @@ function parseBinaryPointCloud(buffer: ArrayBuffer) {
   statElapsed.textContent = elapsed.toFixed(1) + 's';
 }
 
+function fetchStats() {
+  fetch(`${API_URL}/stats`)
+    .then(r => r.json())
+    .then(s => {
+      statFramesRecv.textContent = (s.frames_received ?? 0).toLocaleString();
+      statFramesDropped.textContent = (s.frames_dropped ?? 0).toLocaleString();
+      statQueue.textContent = (s.queue_size ?? 0).toString();
+      statChunksSent.textContent = (s.chunks_sent ?? 0).toString();
+      const w = s.workers ?? 1;
+      statEngine.textContent = w > 1 ? `parallel ×${w}` : 'sequential';
+      if (!s.processing_alive) {
+        statEngine.textContent += ' ⚠️';
+        statEngine.classList.add('text-red-400');
+      }
+    })
+    .catch(() => {});
+}
+
 function connect() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
@@ -261,6 +336,8 @@ function connect() {
     connectBtn.disabled = true;
     disconnectBtn.disabled = false;
     resetBtn.disabled = false;
+    // Fetch initial pipeline stats
+    fetchStats();
   };
 
   ws.onmessage = (event) => {
@@ -314,6 +391,21 @@ function handleMessage(msg: any) {
       statBuffered.textContent = msg.frames_buffered + ' / ' + (msg.frames_buffered + msg.frames_needed);
       statPoints.textContent = msg.total_points.toLocaleString();
       statChunks.textContent = msg.chunks_processed.toString();
+      if (msg.frames_received !== undefined) {
+        statFramesRecv.textContent = msg.frames_received.toLocaleString();
+      }
+      if (msg.frames_dropped !== undefined) {
+        statFramesDropped.textContent = msg.frames_dropped.toLocaleString();
+        statFramesDropped.className = msg.frames_dropped > 0
+          ? 'stat-value text-xs font-mono text-red-400'
+          : 'stat-value text-xs font-mono';
+      }
+      if (msg.queue_size !== undefined) {
+        statQueue.textContent = msg.queue_size.toString();
+      }
+      if (msg.chunks_sent !== undefined) {
+        statChunksSent.textContent = msg.chunks_sent.toString();
+      }
       break;
 
     case 'processing':
@@ -755,6 +847,29 @@ resetBtn.addEventListener('click', () => {
 });
 resetViewBtn.addEventListener('click', resetView);
 
+saveStateBtn.addEventListener('click', async () => {
+  saveStateBtn.disabled = true;
+  saveStateBtn.textContent = 'Saving...';
+  try {
+    const res = await fetch(`${API_URL}/save`, { method: 'POST' });
+    const data = await res.json();
+    if (res.ok) {
+      saveStateBtn.textContent = `Saved ✓`;
+      console.log('[Save]', data);
+    } else {
+      saveStateBtn.textContent = 'Save Failed';
+      console.error('[Save] Error:', data.error);
+    }
+  } catch (e) {
+    saveStateBtn.textContent = 'Save Failed';
+    console.error('[Save]', e);
+  }
+  setTimeout(() => {
+    saveStateBtn.disabled = false;
+    saveStateBtn.textContent = 'Save State';
+  }, 2000);
+});
+
 settingsBtn.addEventListener('click', () => {
   settingsPanel.classList.toggle('hidden');
 });
@@ -928,3 +1043,6 @@ function animate() {
 }
 
 animate();
+
+// Poll pipeline stats every 5 seconds for visibility even between chunk updates
+setInterval(fetchStats, 5000);

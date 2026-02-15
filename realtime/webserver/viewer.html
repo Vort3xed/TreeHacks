@@ -16,7 +16,7 @@
     </div>
 
     <!-- Stats Panel -->
-    <div id="stats-panel" class="fixed top-4 right-4 glass-panel p-4 w-56 z-10 space-y-3">
+    <div id="stats-panel" class="fixed top-4 right-4 glass-panel p-4 w-56 z-10 space-y-2">
       <div class="text-sm font-semibold text-white/80 border-b border-white/10 pb-2">Pi3X Live</div>
 
       <div class="flex justify-between items-center">
@@ -28,12 +28,37 @@
         <span id="stat-chunks" class="stat-value text-sm">0</span>
       </div>
       <div class="flex justify-between items-center">
-        <span class="stat-label">Buffered</span>
-        <span id="stat-buffered" class="stat-value text-sm">0</span>
-      </div>
-      <div class="flex justify-between items-center">
         <span class="stat-label">Last Chunk</span>
         <span id="stat-elapsed" class="stat-value text-sm">-</span>
+      </div>
+
+      <!-- Divider -->
+      <div class="border-t border-white/10 pt-1"></div>
+      <div class="text-xs font-semibold text-white/50 uppercase tracking-wide">Pipeline</div>
+
+      <div class="flex justify-between items-center">
+        <span class="stat-label text-xs">Frames Recv</span>
+        <span id="stat-frames-recv" class="stat-value text-xs font-mono">0</span>
+      </div>
+      <div class="flex justify-between items-center">
+        <span class="stat-label text-xs">Frames Dropped</span>
+        <span id="stat-frames-dropped" class="stat-value text-xs font-mono text-red-400">0</span>
+      </div>
+      <div class="flex justify-between items-center">
+        <span class="stat-label text-xs">Buffered</span>
+        <span id="stat-buffered" class="stat-value text-xs font-mono">0</span>
+      </div>
+      <div class="flex justify-between items-center">
+        <span class="stat-label text-xs">Queue</span>
+        <span id="stat-queue" class="stat-value text-xs font-mono">0</span>
+      </div>
+      <div class="flex justify-between items-center">
+        <span class="stat-label text-xs">Chunks Sent</span>
+        <span id="stat-chunks-sent" class="stat-value text-xs font-mono">0</span>
+      </div>
+      <div class="flex justify-between items-center">
+        <span class="stat-label text-xs">Engine</span>
+        <span id="stat-engine" class="stat-value text-xs font-mono">-</span>
       </div>
 
       <!-- Progress Bar -->
@@ -232,6 +257,7 @@
       <button id="connect-btn" class="btn-primary text-sm">Connect</button>
       <button id="disconnect-btn" class="btn-danger text-sm" disabled>Disconnect</button>
       <button id="reset-btn" class="btn-secondary text-sm" disabled>Reset</button>
+      <button id="save-state-btn" class="btn-accent text-sm">Save State</button>
       <div class="w-px h-6 bg-white/10"></div>
       <button id="reset-view-btn" class="btn-secondary text-sm">Reset View</button>
       <button id="settings-btn" class="btn-secondary text-sm">Settings</button>
