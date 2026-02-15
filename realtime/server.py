@@ -24,8 +24,10 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
 
 from pipeline import IncrementalPi3
+from object_labeler import ObjectLabeler, FrameData
 
 # ─────────────────────────────────────────
 # FastAPI App
@@ -37,6 +39,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # Global State
 # ─────────────────────────────────────────
 pipeline: IncrementalPi3 = None
+object_labeler: ObjectLabeler = None
 frame_queue: queue.Queue = queue.Queue(maxsize=60)
 connected_viewers: set[WebSocket] = set()
 processing_lock = threading.Lock()
@@ -354,6 +357,127 @@ async def stop_video():
     """Stop the video feeder."""
     video_feeder_stop.set()
     return {"status": "stopped"}
+
+
+# ─────────────────────────────────────────
+# Object Labeling Endpoint (fire-and-forget)
+# ─────────────────────────────────────────
+class LabelRequest(BaseModel):
+    prompts: list[str]
+    confidence: float = 0.3
+    max_frames: int = 20
+
+_labeling_in_progress = False
+
+@app.post("/label-objects")
+async def label_objects_endpoint(req: LabelRequest):
+    """
+    Run SAM3 object labeling in the background (non-blocking).
+    Returns 202 immediately. Results are broadcast via WebSocket
+    when labeling completes.
+    """
+    global _labeling_in_progress
+
+    prompts = req.prompts
+    confidence = req.confidence
+    max_frames = req.max_frames
+
+    if not prompts:
+        return JSONResponse({"error": "No prompts provided"}, status_code=400)
+
+    if pipeline is None or not pipeline.frame_data:
+        return JSONResponse({"error": "No frames available yet. Process some chunks first."},
+                            status_code=400)
+
+    if _labeling_in_progress:
+        return JSONResponse({"error": "Labeling already in progress"}, status_code=409)
+
+    # Notify viewers that labeling is starting
+    await broadcast_to_viewers({'type': 'labeling_start', 'prompts': prompts})
+
+    # Capture the event loop for broadcasting from the background thread
+    loop = asyncio.get_event_loop()
+
+    # Copy frame_data snapshot so background thread doesn't fight with pipeline
+    frame_data_snapshot = list(pipeline.frame_data)
+
+    def _run_labeling_background():
+        """Runs in a daemon thread. Broadcasts results via WebSocket when done."""
+        global object_labeler, _labeling_in_progress
+        _labeling_in_progress = True
+
+        try:
+            if object_labeler is None:
+                object_labeler = ObjectLabeler(
+                    device='cuda' if torch.cuda.is_available() else 'cpu'
+                )
+
+            # Convert pipeline frame_data dicts to FrameData objects
+            frame_data_list = [
+                FrameData(
+                    frame_idx=fd['frame_idx'],
+                    image=fd['image'],
+                    point_map=fd['point_map'],
+                    conf_mask=fd['conf_mask'],
+                )
+                for fd in frame_data_snapshot
+            ]
+
+            results = object_labeler.label_objects(
+                frames=frame_data_list,
+                prompts=prompts,
+                confidence_threshold=confidence,
+                max_frames=max_frames,
+                include_debug_images=True,
+                max_debug_images=5,
+            )
+
+            # Serialize results (including OBB corners, rotation, debug images)
+            objects_json = [
+                {
+                    'label': obj.label,
+                    'instance_id': obj.instance_id,
+                    'bbox_min': obj.bbox_min,
+                    'bbox_max': obj.bbox_max,
+                    'center': obj.center,
+                    'extent': obj.extent,
+                    'rotation': obj.rotation,
+                    'corners': obj.corners,
+                    'confidence': round(obj.confidence, 3),
+                    'point_count': obj.point_count,
+                    'debug_images': obj.debug_images,
+                }
+                for obj in results
+            ]
+
+            # Broadcast to all viewers from the event loop
+            asyncio.run_coroutine_threadsafe(
+                broadcast_to_viewers({
+                    'type': 'labeled_objects',
+                    'objects': objects_json,
+                }),
+                loop,
+            )
+
+            print(f"[Server] Labeling complete: {len(results)} objects broadcast to viewers")
+
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            asyncio.run_coroutine_threadsafe(
+                broadcast_to_viewers({'type': 'labeling_error', 'error': str(e)}),
+                loop,
+            )
+        finally:
+            _labeling_in_progress = False
+
+    # Fire-and-forget: start background thread, return 202 immediately
+    t = threading.Thread(target=_run_labeling_background, daemon=True)
+    t.start()
+
+    return JSONResponse(
+        {"status": "labeling_started", "prompts": prompts, "max_frames": max_frames},
+        status_code=202,
+    )
 
 
 # ─────────────────────────────────────────

@@ -1,6 +1,7 @@
 import './main.css';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
 
 // ════════════════════════════════════════
 // Constants
@@ -50,6 +51,19 @@ const uploadBtn = document.getElementById('upload-btn') as HTMLButtonElement;
 const stopVideoBtn = document.getElementById('stop-video-btn') as HTMLButtonElement;
 const uploadStatus = document.getElementById('upload-status')!;
 
+// Label panel
+const labelPanel = document.getElementById('label-panel')!;
+const labelToggleBtn = document.getElementById('label-toggle-btn')!;
+const labelPromptsInput = document.getElementById('label-prompts') as HTMLInputElement;
+const labelConfidenceInput = document.getElementById('label-confidence') as HTMLInputElement;
+const labelMaxFramesInput = document.getElementById('label-max-frames') as HTMLInputElement;
+const labelRunBtn = document.getElementById('label-run-btn') as HTMLButtonElement;
+const labelClearBtn = document.getElementById('label-clear-btn') as HTMLButtonElement;
+const toggleBoxesBtn = document.getElementById('toggle-boxes')!;
+const labelStatus = document.getElementById('label-status')!;
+const labelResults = document.getElementById('label-results')!;
+const labelResultsList = document.getElementById('label-results-list')!;
+
 // Controls
 const connectBtn = document.getElementById('connect-btn') as HTMLButtonElement;
 const disconnectBtn = document.getElementById('disconnect-btn') as HTMLButtonElement;
@@ -69,6 +83,15 @@ const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 container.appendChild(renderer.domElement);
+
+// CSS2D renderer for text labels
+const labelRenderer = new CSS2DRenderer();
+labelRenderer.setSize(window.innerWidth, window.innerHeight);
+labelRenderer.domElement.style.position = 'absolute';
+labelRenderer.domElement.style.top = '0';
+labelRenderer.domElement.style.left = '0';
+labelRenderer.domElement.style.pointerEvents = 'none';
+container.appendChild(labelRenderer.domElement);
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
@@ -123,9 +146,36 @@ scene.add(cloudGroup);
 let ws: WebSocket | null = null;
 let autoRotate = false;
 let showGrid = true;
+let showBoxes = true;
 let configDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 let orientFlip = { x: 1, y: -1, z: -1 }; // default: OpenCV→GL correction
 let orientRot = { x: 0, y: 0, z: 0 }; // rotation in degrees
+
+// Object labeling state
+interface DebugImage {
+  frame_idx: number;
+  mask_b64: string;
+  score: number;
+}
+
+interface LabeledObject {
+  label: string;
+  instance_id: number;
+  bbox_min: [number, number, number];
+  bbox_max: [number, number, number];
+  center: [number, number, number];
+  extent: [number, number, number];
+  rotation: number[][];   // 3x3 rotation matrix
+  corners: number[][];    // 8 corner points of OBB
+  confidence: number;
+  point_count: number;
+  debug_images: DebugImage[];
+}
+
+const labelGroup = new THREE.Group();
+cloudGroup.add(labelGroup); // attach to cloudGroup so orientation transforms apply
+let labeledObjects: LabeledObject[] = [];
+let isLabeling = false;
 
 // ════════════════════════════════════════
 // Functions
@@ -306,6 +356,27 @@ function handleMessage(msg: any) {
       setStatus('connected', `Chunk skipped: ${msg.reason}`);
       setTimeout(() => { if (ws?.readyState === WebSocket.OPEN) setStatus('connected', 'Connected'); }, 3000);
       break;
+
+    case 'labeled_objects':
+      isLabeling = false;
+      labelRunBtn.disabled = false;
+      labeledObjects = msg.objects as LabeledObject[];
+      renderLabeledObjects(labeledObjects);
+      updateLabelResultsList(labeledObjects);
+      labelStatus.textContent = `Found ${labeledObjects.length} object(s)`;
+      break;
+
+    case 'labeling_start':
+      isLabeling = true;
+      labelRunBtn.disabled = true;
+      labelStatus.textContent = `Labeling: ${msg.prompts.join(', ')}...`;
+      break;
+
+    case 'labeling_error':
+      isLabeling = false;
+      labelRunBtn.disabled = false;
+      labelStatus.textContent = `Error: ${msg.error}`;
+      break;
   }
 }
 
@@ -328,6 +399,273 @@ function resetView() {
   camera.position.set(0, 2, 5);
   controls.target.set(0, 0, 0);
   controls.update();
+}
+
+// ════════════════════════════════════════
+// Object Labeling
+// ════════════════════════════════════════
+
+// Color palette for bounding box classes
+const LABEL_COLORS: { [key: string]: string } = {};
+const PALETTE = [
+  '#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8',
+  '#F7DC6F', '#BB8FCE', '#85C1E9', '#F0B27A', '#82E0AA',
+  '#D7BDE2', '#F8C471', '#76D7C4', '#F1948A', '#AED6F1',
+];
+let colorIdx = 0;
+
+function getLabelColor(label: string): string {
+  if (!LABEL_COLORS[label]) {
+    LABEL_COLORS[label] = PALETTE[colorIdx % PALETTE.length];
+    colorIdx++;
+  }
+  return LABEL_COLORS[label];
+}
+
+function clearLabels() {
+  // Remove all children from label group
+  while (labelGroup.children.length > 0) {
+    const child = labelGroup.children[0];
+    if (child instanceof CSS2DObject) {
+      child.element.remove();
+    }
+    labelGroup.remove(child);
+  }
+  labeledObjects = [];
+  labelResults.classList.add('hidden');
+  labelResultsList.innerHTML = '';
+  labelStatus.textContent = '';
+}
+
+function renderLabeledObjects(objects: LabeledObject[]) {
+  // Clear previous labels
+  while (labelGroup.children.length > 0) {
+    const child = labelGroup.children[0];
+    if (child instanceof CSS2DObject) {
+      child.element.remove();
+    }
+    labelGroup.remove(child);
+  }
+
+  for (const obj of objects) {
+    const color = getLabelColor(obj.label);
+    const threeColor = new THREE.Color(color);
+
+    // Oriented bounding box from 8 corners
+    if (obj.corners && obj.corners.length === 8) {
+      const c = obj.corners.map(p => new THREE.Vector3(p[0], p[1], p[2]));
+
+      // Open3D OBB corners are ordered: 0-3 = bottom face, 4-7 = top face
+      // Edges: bottom 0-1-2-3-0, top 4-5-6-7-4, verticals 0-4 1-5 2-6 3-7
+      const edgePairs = [
+        [0, 1], [1, 2], [2, 3], [3, 0],   // bottom face
+        [4, 5], [5, 6], [6, 7], [7, 4],   // top face
+        [0, 4], [1, 5], [2, 6], [3, 7],   // verticals
+      ];
+
+      const linePositions: number[] = [];
+      for (const [a, b] of edgePairs) {
+        linePositions.push(c[a].x, c[a].y, c[a].z);
+        linePositions.push(c[b].x, c[b].y, c[b].z);
+      }
+
+      const lineGeo = new THREE.BufferGeometry();
+      lineGeo.setAttribute('position', new THREE.Float32BufferAttribute(linePositions, 3));
+      const lineMat = new THREE.LineBasicMaterial({ color: threeColor, linewidth: 2 });
+      const wireframe = new THREE.LineSegments(lineGeo, lineMat);
+      labelGroup.add(wireframe);
+    } else {
+      // Fallback to AABB if no corners available
+      const bboxMin = new THREE.Vector3(...obj.bbox_min);
+      const bboxMax = new THREE.Vector3(...obj.bbox_max);
+      const box3 = new THREE.Box3(bboxMin, bboxMax);
+      const boxHelper = new THREE.Box3Helper(box3, threeColor);
+      labelGroup.add(boxHelper);
+    }
+
+    // Text label using CSS2DObject
+    const labelDiv = document.createElement('div');
+    labelDiv.style.cssText = `
+      background: ${color}dd;
+      color: white;
+      font-family: ui-monospace, monospace;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 4px;
+      white-space: nowrap;
+      pointer-events: none;
+      text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    `;
+    labelDiv.textContent = `${obj.label} (${(obj.confidence * 100).toFixed(0)}%)`;
+
+    const labelObj = new CSS2DObject(labelDiv);
+    // Position label at center + half extent upward (or top of AABB)
+    labelObj.position.set(
+      obj.center[0],
+      obj.bbox_max[1] + 0.1,
+      obj.center[2],
+    );
+    labelGroup.add(labelObj);
+  }
+
+  // Show debug images panel
+  renderDebugImages(objects);
+
+  labelGroup.visible = showBoxes;
+}
+
+function updateLabelResultsList(objects: LabeledObject[]) {
+  labelResults.classList.remove('hidden');
+  labelResultsList.innerHTML = '';
+
+  for (const obj of objects) {
+    const color = getLabelColor(obj.label);
+    const item = document.createElement('div');
+    item.className = 'flex items-center gap-2 text-xs text-white/70 py-0.5';
+    item.innerHTML = `
+      <span style="background:${color}; width:8px; height:8px; border-radius:50%; flex-shrink:0;"></span>
+      <span class="flex-1">${obj.label}</span>
+      <span class="text-white/40">${(obj.confidence * 100).toFixed(0)}%</span>
+      <span class="text-white/40">${obj.point_count.toLocaleString()} pts</span>
+    `;
+    labelResultsList.appendChild(item);
+  }
+}
+
+function renderDebugImages(objects: LabeledObject[]) {
+  const debugContainer = document.getElementById('debug-images-container');
+  const debugPanel = document.getElementById('debug-panel');
+  if (!debugContainer || !debugPanel) return;
+
+  debugContainer.innerHTML = '';
+
+  // Collect all debug images from all objects
+  let hasImages = false;
+  for (const obj of objects) {
+    if (!obj.debug_images || obj.debug_images.length === 0) continue;
+    hasImages = true;
+    const color = getLabelColor(obj.label);
+
+    const objSection = document.createElement('div');
+    objSection.className = 'mb-3';
+    objSection.innerHTML = `
+      <div class="flex items-center gap-2 mb-1">
+        <span style="background:${color}; width:8px; height:8px; border-radius:50%; flex-shrink:0;"></span>
+        <span class="text-xs text-white/80 font-semibold">${obj.label}</span>
+        <span class="text-xs text-white/40">${(obj.confidence * 100).toFixed(0)}%</span>
+      </div>
+    `;
+
+    const imgGrid = document.createElement('div');
+    imgGrid.className = 'grid grid-cols-2 gap-1';
+
+    for (const dbg of obj.debug_images) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'relative';
+      wrapper.innerHTML = `
+        <img src="data:image/png;base64,${dbg.mask_b64}"
+             class="w-full rounded border border-white/10 cursor-pointer hover:border-white/40 transition"
+             alt="Frame ${dbg.frame_idx}" />
+        <div class="absolute bottom-0 left-0 right-0 bg-black/60 text-[9px] text-white/70 px-1 py-0.5">
+          F${dbg.frame_idx} · ${(dbg.score * 100).toFixed(0)}%
+        </div>
+      `;
+      // Click to enlarge
+      wrapper.querySelector('img')!.addEventListener('click', () => {
+        showFullscreenImage(dbg.mask_b64, `${obj.label} — Frame ${dbg.frame_idx} (${(dbg.score * 100).toFixed(0)}%)`);
+      });
+      imgGrid.appendChild(wrapper);
+    }
+
+    objSection.appendChild(imgGrid);
+    debugContainer.appendChild(objSection);
+  }
+
+  if (hasImages) {
+    debugPanel.classList.remove('hidden');
+  } else {
+    debugPanel.classList.add('hidden');
+  }
+}
+
+function showFullscreenImage(base64: string, caption: string) {
+  // Create fullscreen overlay for image inspection
+  const overlay = document.createElement('div');
+  overlay.style.cssText = `
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.85); z-index: 10000;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    cursor: pointer;
+  `;
+  overlay.innerHTML = `
+    <img src="data:image/png;base64,${base64}" style="max-width: 90vw; max-height: 80vh; border-radius: 8px;" />
+    <div style="color: white; font-size: 14px; margin-top: 12px; font-family: monospace;">${caption}</div>
+    <div style="color: white/50; font-size: 11px; margin-top: 4px;">Click anywhere to close</div>
+  `;
+  overlay.addEventListener('click', () => overlay.remove());
+  document.body.appendChild(overlay);
+}
+
+async function runLabeling() {
+  const promptsStr = labelPromptsInput.value.trim();
+  if (!promptsStr) {
+    labelStatus.textContent = 'Enter object names first';
+    return;
+  }
+
+  const prompts = promptsStr.split(',').map(s => s.trim()).filter(Boolean);
+  const confidence = parseFloat(labelConfidenceInput.value) || 0.3;
+  const maxFrames = parseInt(labelMaxFramesInput.value) || 20;
+
+  labelRunBtn.disabled = true;
+  labelStatus.textContent = 'Sending labeling request...';
+
+  try {
+    const response = await fetch(`${API_URL}/label-objects`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompts,
+        confidence,
+        max_frames: maxFrames,
+      }),
+    });
+
+    if (response.status === 202) {
+      // Fire-and-forget: server accepted, results will arrive via WebSocket
+      labelStatus.textContent = 'Labeling in progress (running in background)...';
+      // Don't re-enable button — will be re-enabled when results arrive via WS
+      return;
+    }
+
+    if (response.status === 409) {
+      labelStatus.textContent = 'Labeling already in progress';
+      labelRunBtn.disabled = false;
+      return;
+    }
+
+    if (!response.ok) {
+      const err = await response.json();
+      labelStatus.textContent = `Error: ${err.error || response.statusText}`;
+      labelRunBtn.disabled = false;
+      return;
+    }
+
+    // Fallback: direct response (shouldn't happen with new server)
+    const result = await response.json();
+    if (result.objects) {
+      labeledObjects = result.objects as LabeledObject[];
+      renderLabeledObjects(labeledObjects);
+      updateLabelResultsList(labeledObjects);
+      labelStatus.textContent = `Found ${labeledObjects.length} object(s)`;
+    }
+    labelRunBtn.disabled = false;
+  } catch (err) {
+    labelStatus.textContent = `Error: ${(err as Error).message}`;
+    labelRunBtn.disabled = false;
+  }
 }
 
 // ════════════════════════════════════════
@@ -501,11 +839,31 @@ videoFileInput.addEventListener('change', () => {
 uploadBtn.addEventListener('click', uploadVideo);
 stopVideoBtn.addEventListener('click', stopVideo);
 
+// Label panel toggle & controls
+labelToggleBtn.addEventListener('click', () => {
+  labelPanel.classList.toggle('hidden');
+});
+
+labelRunBtn.addEventListener('click', runLabeling);
+labelClearBtn.addEventListener('click', clearLabels);
+
+// Debug panel close
+document.getElementById('debug-close-btn')?.addEventListener('click', () => {
+  document.getElementById('debug-panel')?.classList.add('hidden');
+});
+
+toggleBoxesBtn.addEventListener('click', () => {
+  showBoxes = !showBoxes;
+  labelGroup.visible = showBoxes;
+  toggleBoxesBtn.textContent = showBoxes ? 'ON' : 'OFF';
+});
+
 // Resize
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  labelRenderer.setSize(window.innerWidth, window.innerHeight);
 });
 
 // ════════════════════════════════════════
@@ -515,6 +873,7 @@ function animate() {
   requestAnimationFrame(animate);
   controls.update();
   renderer.render(scene, camera);
+  labelRenderer.render(scene, camera);
 }
 
 animate();

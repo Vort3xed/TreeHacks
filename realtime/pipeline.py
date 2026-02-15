@@ -93,6 +93,10 @@ class IncrementalPi3:
         self.chunks_processed = 0
         self.is_first_chunk = True
 
+        # Per-frame data for object labeling (stored on CPU)
+        self.frame_data: list[dict] = []  # list of {image, point_map, conf_mask}
+        self._global_frame_idx = 0
+
     def load_model(self, ckpt: Optional[str] = None):
         """Load the Pi3X model. Call once at startup."""
         print("[Pipeline] Loading Pi3X model...")
@@ -273,11 +277,27 @@ class IncrementalPi3:
             new_pts = aligned_pts[0]        # (T, H, W, 3)
             new_conf = curr_mask[0]         # (T, H, W)
             new_imgs = chunk_imgs[0]        # (T, 3, H, W)
+            new_start = 0
         else:
             overlap = self.overlap
             new_pts = aligned_pts[0, overlap:]
             new_conf = curr_mask[0, overlap:]
             new_imgs = chunk_imgs[0, overlap:]
+            new_start = overlap
+
+        # Store per-frame data for object labeling
+        n_new = new_pts.shape[0]
+        for fi in range(n_new):
+            frame_img = (new_imgs[fi].permute(1, 2, 0) * 255).byte().cpu().numpy()  # (H, W, 3) RGB uint8
+            frame_pts = new_pts[fi].cpu().numpy().astype(np.float32)                 # (H, W, 3)
+            frame_mask = new_conf[fi].cpu().numpy()                                  # (H, W) bool
+            self.frame_data.append({
+                'frame_idx': self._global_frame_idx,
+                'image': frame_img,
+                'point_map': frame_pts,
+                'conf_mask': frame_mask,
+            })
+            self._global_frame_idx += 1
 
         # Extract valid points and colors
         valid_pts = new_pts[new_conf].cpu().numpy()                          # (N, 3)
@@ -415,6 +435,8 @@ class IncrementalPi3:
         self.is_first_chunk = True
         self.target_w = None
         self.target_h = None
+        self.frame_data.clear()
+        self._global_frame_idx = 0
         torch.cuda.empty_cache()
         print("[Pipeline] Reset complete")
 
