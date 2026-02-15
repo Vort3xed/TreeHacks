@@ -72,6 +72,14 @@ const labelResultsList = document.getElementById('label-results-list')!;
 const promptModeToggle = document.getElementById('prompt-mode-toggle') as HTMLButtonElement;
 const promptModeLabel = document.getElementById('prompt-mode-label')!;
 
+// Analysis panel
+const analysisToggleBtn = document.getElementById('analysis-toggle-btn') as HTMLButtonElement;
+const analysisPanel = document.getElementById('analysis-panel')!;
+const analysisMessages = document.getElementById('analysis-messages')!;
+const analysisInput = document.getElementById('analysis-input') as HTMLInputElement;
+const analysisSendBtn = document.getElementById('analysis-send-btn') as HTMLButtonElement;
+const analysisObjCount = document.getElementById('analysis-obj-count')!;
+
 // Controls
 const connectBtn = document.getElementById('connect-btn') as HTMLButtonElement;
 const disconnectBtn = document.getElementById('disconnect-btn') as HTMLButtonElement;
@@ -186,6 +194,7 @@ cloudGroup.add(labelGroup); // attach to cloudGroup so orientation transforms ap
 let labeledObjects: LabeledObject[] = [];
 let isLabeling = false;
 let promptMode: 'direct' | 'natural' = 'direct';
+let analysisHistory: Array<{role: string, text: string}> = [];
 
 // ════════════════════════════════════════
 // Functions
@@ -459,6 +468,10 @@ function handleMessage(msg: any) {
       renderLabeledObjects(labeledObjects);
       updateLabelResultsList(labeledObjects);
       labelStatus.textContent = `Found ${labeledObjects.length} object(s)`;
+      // Enable analysis button now that we have labeled objects
+      analysisToggleBtn.disabled = false;
+      analysisToggleBtn.classList.remove('opacity-50');
+      analysisObjCount.textContent = `${labeledObjects.length} objects`;
       break;
 
     case 'labeling_start':
@@ -530,6 +543,13 @@ function clearLabels() {
   labelResults.classList.add('hidden');
   labelResultsList.innerHTML = '';
   labelStatus.textContent = '';
+  // Disable analysis and clear chat history
+  analysisToggleBtn.disabled = true;
+  analysisToggleBtn.classList.add('opacity-50');
+  analysisPanel.classList.add('hidden');
+  analysisHistory = [];
+  analysisMessages.innerHTML = '';
+  analysisObjCount.textContent = '0 objects';
 }
 
 function renderLabeledObjects(objects: LabeledObject[]) {
@@ -1016,6 +1036,75 @@ promptModeToggle.addEventListener('click', () => {
 // Debug panel close
 document.getElementById('debug-close-btn')?.addEventListener('click', () => {
   document.getElementById('debug-panel')?.classList.add('hidden');
+});
+
+// Analysis panel toggle & chat
+analysisToggleBtn.addEventListener('click', () => {
+  analysisPanel.classList.toggle('hidden');
+  if (!analysisPanel.classList.contains('hidden')) {
+    analysisInput.focus();
+  }
+});
+
+async function sendAnalysisQuestion() {
+  const question = analysisInput.value.trim();
+  if (!question || labeledObjects.length === 0) return;
+
+  // Show user message
+  appendAnalysisMessage('user', question);
+  analysisInput.value = '';
+  analysisSendBtn.disabled = true;
+  analysisInput.disabled = true;
+
+  // Prepare objects payload
+  const objects = labeledObjects.map(o => ({
+    label: o.label,
+    center: o.center,
+    extent: o.extent,
+    confidence: o.confidence,
+    point_count: o.point_count,
+  }));
+
+  try {
+    const resp = await fetch(`https://${location.hostname}:5000/analyze`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question, objects, history: analysisHistory }),
+    });
+    const data = await resp.json();
+    if (data.answer) {
+      appendAnalysisMessage('ai', data.answer);
+      // Update history for multi-turn
+      analysisHistory.push({ role: 'user', text: question });
+      analysisHistory.push({ role: 'model', text: data.answer });
+    } else {
+      appendAnalysisMessage('ai', `Error: ${data.error || 'Unknown error'}`);
+    }
+  } catch (err: any) {
+    appendAnalysisMessage('ai', `Request failed: ${err.message}`);
+  } finally {
+    analysisSendBtn.disabled = false;
+    analysisInput.disabled = false;
+    analysisInput.focus();
+  }
+}
+
+function appendAnalysisMessage(role: 'user' | 'ai', text: string) {
+  const div = document.createElement('div');
+  div.className = role === 'user'
+    ? 'text-right text-sm bg-blue-600/30 rounded-lg px-3 py-2 ml-8'
+    : 'text-left text-sm bg-white/10 rounded-lg px-3 py-2 mr-8';
+  div.textContent = text;
+  analysisMessages.appendChild(div);
+  analysisMessages.scrollTop = analysisMessages.scrollHeight;
+}
+
+analysisSendBtn.addEventListener('click', sendAnalysisQuestion);
+analysisInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendAnalysisQuestion();
+  }
 });
 
 toggleBoxesBtn.addEventListener('click', () => {

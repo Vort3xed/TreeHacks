@@ -17,7 +17,7 @@
 
     <!-- Stats Panel -->
     <div id="stats-panel" class="fixed top-4 right-4 glass-panel p-4 w-56 z-10 space-y-2">
-      <div class="text-sm font-semibold text-white/80 border-b border-white/10 pb-2">Pi3X Live</div>
+      <div class="text-sm font-semibold text-white/80 border-b border-white/10 pb-2"></div>
 
       <div class="flex justify-between items-center">
         <span class="stat-label">Points</span>
@@ -192,7 +192,7 @@
 
     <!-- Object Labeling Panel -->
     <div id="label-panel" class="fixed bottom-20 left-1/2 -translate-x-1/2 glass-panel p-4 w-96 z-10 space-y-3 hidden">
-      <div class="text-sm font-semibold text-white/80 border-b border-white/10 pb-2">Object Labeling (SAM3)</div>
+      <div class="text-sm font-semibold text-white/80 border-b border-white/10 pb-2">Object Labeling</div>
 
       <div class="space-y-2">
         <!-- Prompt mode toggle -->
@@ -202,7 +202,7 @@
         </div>
 
         <div>
-          <label id="prompt-mode-label" class="stat-label block mb-1">Object prompts (comma-separated)</label>
+          <label id="prompt-mode-label" class="stat-label block mb-1">Object prompts</label>
           <input type="text" id="label-prompts" placeholder="chair, table, monitor, person..."
             class="w-full bg-white/10 text-white text-sm rounded-lg px-3 py-2 border border-white/10
             placeholder:text-white/30 focus:outline-none focus:border-accent-blue/50" />
@@ -241,6 +241,25 @@
       </div>
     </div>
 
+    <!-- Analysis Chat Panel -->
+    <div id="analysis-panel" class="fixed bottom-20 right-4 glass-panel p-4 w-96 z-10 hidden flex flex-col" style="max-height: 60vh;">
+      <div class="text-sm font-semibold text-white/80 border-b border-white/10 pb-2 mb-2 flex items-center justify-between">
+        <span>Scene Analysis (Gemini)</span>
+        <span id="analysis-obj-count" class="text-xs text-white/40 font-mono">0 objects</span>
+      </div>
+
+      <div id="analysis-messages" class="flex-1 overflow-y-auto space-y-2 mb-3 min-h-[100px]" style="max-height: 40vh;">
+        <div class="text-xs text-white/30 text-center py-4">Ask questions about the detected objects in your scene</div>
+      </div>
+
+      <div class="flex gap-2">
+        <input type="text" id="analysis-input" placeholder="e.g. How far apart are the chairs?"
+          class="flex-1 bg-white/10 text-white text-sm rounded-lg px-3 py-2 border border-white/10
+          placeholder:text-white/30 focus:outline-none focus:border-accent-blue/50" />
+        <button id="analysis-send-btn" class="btn-primary text-xs px-4">Send</button>
+      </div>
+    </div>
+
     <!-- Debug: SAM Segmentation Images -->
     <div id="debug-panel" class="fixed top-4 right-4 glass-panel p-3 w-72 z-10 space-y-2 hidden max-h-[80vh] overflow-y-auto">
       <div class="flex items-center justify-between border-b border-white/10 pb-2">
@@ -263,6 +282,7 @@
       <button id="settings-btn" class="btn-secondary text-sm">Settings</button>
       <button id="upload-toggle-btn" class="btn-secondary text-sm">Test Video</button>
       <button id="label-toggle-btn" class="btn-secondary text-sm">Label Objects</button>
+      <button id="analysis-toggle-btn" class="btn-secondary text-sm opacity-50" disabled>Analysis</button>
       <div class="w-px h-6 bg-white/10"></div>
       <a href="/sender.html" class="text-sm text-white/60 hover:text-white transition-colors">Camera Sender</a>
     </div>
