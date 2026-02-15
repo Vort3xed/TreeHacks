@@ -12,6 +12,7 @@
     "three": "^0.160.0"
   },
   "devDependencies": {
+    "@types/node": "^25.2.3",
     "@types/three": "^0.160.0",
     "autoprefixer": "^10.4.20",
     "postcss": "^8.4.49",

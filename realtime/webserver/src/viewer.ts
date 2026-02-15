@@ -125,6 +125,7 @@ let autoRotate = false;
 let showGrid = true;
 let configDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 let orientFlip = { x: 1, y: -1, z: -1 }; // default: OpenCV→GL correction
+let orientRot = { x: 0, y: 0, z: 0 }; // rotation in degrees
 
 // ════════════════════════════════════════
 // Functions
@@ -430,8 +431,21 @@ toggleRotateBtn.addEventListener('click', () => {
 });
 
 // Orientation controls
+const rotXSlider = document.getElementById('rot-x') as HTMLInputElement;
+const rotXVal = document.getElementById('rot-x-val')!;
+const rotYSlider = document.getElementById('rot-y') as HTMLInputElement;
+const rotYVal = document.getElementById('rot-y-val')!;
+const rotZSlider = document.getElementById('rot-z') as HTMLInputElement;
+const rotZVal = document.getElementById('rot-z-val')!;
+
 function applyOrientation() {
   cloudGroup.scale.set(orientFlip.x, orientFlip.y, orientFlip.z);
+  const deg2rad = Math.PI / 180;
+  cloudGroup.rotation.set(
+    orientRot.x * deg2rad,
+    orientRot.y * deg2rad,
+    orientRot.z * deg2rad
+  );
 }
 
 document.getElementById('flip-x')!.addEventListener('click', () => {
@@ -453,6 +467,30 @@ document.getElementById('fix-opencv')!.addEventListener('click', () => {
   } else {
     orientFlip = { x: 1, y: -1, z: -1 };
   }
+  applyOrientation();
+});
+
+// Rotation sliders
+rotXSlider.addEventListener('input', () => {
+  orientRot.x = parseInt(rotXSlider.value);
+  rotXVal.textContent = orientRot.x + '°';
+  applyOrientation();
+});
+rotYSlider.addEventListener('input', () => {
+  orientRot.y = parseInt(rotYSlider.value);
+  rotYVal.textContent = orientRot.y + '°';
+  applyOrientation();
+});
+rotZSlider.addEventListener('input', () => {
+  orientRot.z = parseInt(rotZSlider.value);
+  rotZVal.textContent = orientRot.z + '°';
+  applyOrientation();
+});
+document.getElementById('reset-rotation')!.addEventListener('click', () => {
+  orientRot = { x: 0, y: 0, z: 0 };
+  rotXSlider.value = '0'; rotXVal.textContent = '0°';
+  rotYSlider.value = '0'; rotYVal.textContent = '0°';
+  rotZSlider.value = '0'; rotZVal.textContent = '0°';
   applyOrientation();
 });
 
