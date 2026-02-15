@@ -1,0 +1,1 @@
+source ~/vggt/bin/activate

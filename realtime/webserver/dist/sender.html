@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <title>Pi3X Camera Sender</title>
+    <script type="module" crossorigin src="/assets/sender-B01c3l6q.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/main-Big6BnXB.js">
+    <link rel="stylesheet" crossorigin href="/assets/main-YW-sEfiV.css">
+  </head>
+  <body>
+    <!-- Camera Feed (background) -->
+    <video id="video" class="fixed inset-0 w-full h-full object-cover" autoplay playsinline></video>
+    <canvas id="canvas" class="hidden"></canvas>
+
+    <!-- Overlay -->
+    <div id="overlay" class="fixed inset-0 flex flex-col justify-between p-4 z-10">
+
+      <!-- Top Status -->
+      <div class="flex items-center justify-between">
+        <div class="glass-panel px-3 py-2 flex items-center gap-2">
+          <span id="status-dot" class="status-dot disconnected"></span>
+          <span id="status-text" class="text-sm font-medium">Not Connected</span>
+          <span id="fps-text" class="text-xs text-white/40 font-mono hidden"></span>
+        </div>
+        <div class="glass-panel px-3 py-2">
+          <span id="frame-count" class="text-sm font-mono text-white/60">0 frames</span>
+        </div>
+      </div>
+
+      <!-- Center: recording indicator -->
+      <div id="recording-indicator" class="hidden self-center">
+        <div class="glass-panel px-4 py-2 flex items-center gap-2">
+          <div class="w-3 h-3 rounded-full bg-red-500 animate-pulse"></div>
+          <span class="text-sm font-semibold">Streaming</span>
+        </div>
+      </div>
+
+      <!-- Bottom Controls -->
+      <div class="flex flex-col items-center gap-3">
+        <!-- FPS Slider -->
+        <div id="fps-control" class="glass-panel px-4 py-2 flex items-center gap-3 hidden">
+          <span class="text-xs text-white/50 uppercase tracking-wider">Send FPS</span>
+          <input type="range" id="send-fps" class="slider-input w-32" min="1" max="10" step="1" value="3" />
+          <span id="send-fps-val" class="text-xs font-mono w-4">3</span>
+        </div>
+
+        <!-- Camera selector -->
+        <div id="camera-select-container" class="glass-panel px-4 py-2 hidden">
+          <select id="camera-select" class="bg-transparent text-sm text-white border-none outline-none cursor-pointer">
+          </select>
+        </div>
+
+        <!-- Buttons -->
+        <div class="glass-panel px-4 py-3 flex items-center gap-3">
+          <button id="start-btn" class="btn-primary text-sm">Start Streaming</button>
+          <button id="stop-btn" class="btn-danger text-sm" disabled>Stop</button>
+          <div class="w-px h-6 bg-white/10"></div>
+          <a href="/viewer.html" class="text-sm text-white/60 hover:text-white transition-colors">Open Viewer</a>
+        </div>
+      </div>
+    </div>
+
+  </body>
+</html>

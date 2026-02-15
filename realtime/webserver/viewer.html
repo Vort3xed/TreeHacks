@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pi3X Viewer</title>
+  </head>
+  <body>
+    <!-- 3D Canvas -->
+    <div id="canvas-container" class="fixed inset-0"></div>
+
+    <!-- Status Bar -->
+    <div id="status-bar" class="fixed top-4 left-4 glass-panel px-4 py-2 flex items-center gap-3 z-10">
+      <span id="status-dot" class="status-dot disconnected"></span>
+      <span id="status-text" class="text-sm font-medium">Disconnected</span>
+    </div>
+
+    <!-- Stats Panel -->
+    <div id="stats-panel" class="fixed top-4 right-4 glass-panel p-4 w-56 z-10 space-y-3">
+      <div class="text-sm font-semibold text-white/80 border-b border-white/10 pb-2">Pi3X Live</div>
+
+      <div class="flex justify-between items-center">
+        <span class="stat-label">Points</span>
+        <span id="stat-points" class="stat-value text-sm">0</span>
+      </div>
+      <div class="flex justify-between items-center">
+        <span class="stat-label">Chunks</span>
+        <span id="stat-chunks" class="stat-value text-sm">0</span>
+      </div>
+      <div class="flex justify-between items-center">
+        <span class="stat-label">Buffered</span>
+        <span id="stat-buffered" class="stat-value text-sm">0</span>
+      </div>
+      <div class="flex justify-between items-center">
+        <span class="stat-label">Last Chunk</span>
+        <span id="stat-elapsed" class="stat-value text-sm">-</span>
+      </div>
+
+      <!-- Progress Bar -->
+      <div id="progress-container" class="hidden">
+        <div class="stat-label mb-1">Processing...</div>
+        <div class="w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
+          <div id="progress-bar" class="h-full bg-accent-blue rounded-full transition-all duration-300" style="width: 0%"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings Panel -->
+    <div id="settings-panel" class="fixed bottom-20 right-4 glass-panel p-4 w-64 z-10 space-y-4 hidden">
+      <div class="text-sm font-semibold text-white/80 border-b border-white/10 pb-2">Settings</div>
+
+      <!-- Point Size -->
+      <div>
+        <label class="stat-label">Point Size</label>
+        <div class="flex items-center gap-2 mt-1">
+          <input type="range" id="point-size" class="slider-input flex-1" min="0.5" max="8" step="0.5" value="2" />
+          <span id="point-size-val" class="text-xs font-mono w-6 text-right">2</span>
+        </div>
+      </div>
+
+      <!-- Chunk Size -->
+      <div>
+        <label class="stat-label">Chunk Size</label>
+        <div class="flex items-center gap-2 mt-1">
+          <input type="range" id="chunk-size" class="slider-input flex-1" min="4" max="20" step="1" value="16" />
+          <span id="chunk-size-val" class="text-xs font-mono w-6 text-right">16</span>
+        </div>
+      </div>
+
+      <!-- Overlap -->
+      <div>
+        <label class="stat-label">Overlap</label>
+        <div class="flex items-center gap-2 mt-1">
+          <input type="range" id="overlap" class="slider-input flex-1" min="2" max="10" step="1" value="6" />
+          <span id="overlap-val" class="text-xs font-mono w-6 text-right">6</span>
+        </div>
+      </div>
+
+      <!-- Confidence -->
+      <div>
+        <label class="stat-label">Confidence</label>
+        <div class="flex items-center gap-2 mt-1">
+          <input type="range" id="conf-thre" class="slider-input flex-1" min="0.01" max="0.5" step="0.01" value="0.05" />
+          <span id="conf-thre-val" class="text-xs font-mono w-10 text-right">0.05</span>
+        </div>
+      </div>
+
+      <!-- Toggles -->
+      <div class="flex items-center justify-between">
+        <span class="stat-label">Grid</span>
+        <button id="toggle-grid" class="btn-secondary text-xs px-3 py-1">ON</button>
+      </div>
+      <div class="flex items-center justify-between">
+        <span class="stat-label">Auto-Rotate</span>
+        <button id="toggle-rotate" class="btn-secondary text-xs px-3 py-1">OFF</button>
+      </div>
+
+      <!-- Orientation -->
+      <div class="border-t border-white/10 pt-3">
+        <span class="stat-label block mb-2">Orientation</span>
+        <div class="grid grid-cols-3 gap-1.5">
+          <button id="flip-x" class="btn-secondary text-xs py-1">Flip X</button>
+          <button id="flip-y" class="btn-secondary text-xs py-1">Flip Y</button>
+          <button id="flip-z" class="btn-secondary text-xs py-1">Flip Z</button>
+        </div>
+        <div class="mt-1.5">
+          <button id="fix-opencv" class="btn-primary text-xs w-full py-1">Fix Upside-Down (CV→GL)</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Video Upload Panel -->
+    <div id="upload-panel" class="fixed bottom-20 left-4 glass-panel p-4 w-72 z-10 space-y-3 hidden">
+      <div class="text-sm font-semibold text-white/80 border-b border-white/10 pb-2">Test Video</div>
+
+      <div class="space-y-2">
+        <input type="file" id="video-file" accept="video/*" class="block w-full text-xs text-white/60
+          file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0
+          file:text-xs file:font-semibold file:bg-accent-blue file:text-white
+          hover:file:bg-blue-600 file:cursor-pointer" />
+
+        <div class="flex items-center gap-2">
+          <label class="stat-label whitespace-nowrap">FPS:</label>
+          <input type="number" id="video-fps" value="2" min="0.5" max="30" step="0.5"
+            class="w-16 bg-white/10 text-white text-xs rounded px-2 py-1 border border-white/10" />
+          <label class="flex items-center gap-1.5 text-xs text-white/60">
+            <input type="checkbox" id="video-fast" checked class="rounded" />
+            Fast
+          </label>
+        </div>
+
+        <div class="flex gap-2">
+          <button id="upload-btn" class="btn-primary text-xs flex-1" disabled>Upload & Process</button>
+          <button id="stop-video-btn" class="btn-danger text-xs" disabled>Stop</button>
+        </div>
+      </div>
+
+      <div id="upload-status" class="text-xs text-white/40"></div>
+    </div>
+
+    <!-- Bottom Controls -->
+    <div id="controls" class="fixed bottom-4 left-1/2 -translate-x-1/2 glass-panel px-4 py-3 flex items-center gap-3 z-10">
+      <button id="connect-btn" class="btn-primary text-sm">Connect</button>
+      <button id="disconnect-btn" class="btn-danger text-sm" disabled>Disconnect</button>
+      <button id="reset-btn" class="btn-secondary text-sm" disabled>Reset</button>
+      <div class="w-px h-6 bg-white/10"></div>
+      <button id="reset-view-btn" class="btn-secondary text-sm">Reset View</button>
+      <button id="settings-btn" class="btn-secondary text-sm">Settings</button>
+      <button id="upload-toggle-btn" class="btn-secondary text-sm">Test Video</button>
+      <div class="w-px h-6 bg-white/10"></div>
+      <a href="/sender.html" class="text-sm text-white/60 hover:text-white transition-colors">Camera Sender</a>
+    </div>
+
+    <script type="module" src="/src/viewer.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,80 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-black text-white font-sans m-0 p-0 overflow-hidden;
+  }
+}
+
+@layer components {
+  .glass-panel {
+    @apply bg-glass-bg border border-glass-border rounded-xl;
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+  }
+
+  .btn-primary {
+    @apply px-4 py-2 bg-accent-blue text-white font-semibold rounded-lg
+           hover:bg-blue-600 active:bg-blue-700 transition-all duration-150
+           disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+
+  .btn-danger {
+    @apply px-4 py-2 bg-accent-red text-white font-semibold rounded-lg
+           hover:bg-red-600 active:bg-red-700 transition-all duration-150
+           disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+
+  .btn-secondary {
+    @apply px-4 py-2 bg-white/10 text-white font-medium rounded-lg
+           hover:bg-white/15 active:bg-white/20 transition-all duration-150
+           disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+
+  .stat-label {
+    @apply text-xs text-white/50 uppercase tracking-wider font-mono;
+  }
+
+  .stat-value {
+    @apply text-lg font-semibold font-mono tabular-nums;
+  }
+
+  .status-dot {
+    @apply w-2.5 h-2.5 rounded-full inline-block;
+  }
+
+  .status-dot.connected {
+    @apply bg-accent-green;
+    box-shadow: 0 0 6px theme('colors.accent.green');
+  }
+
+  .status-dot.disconnected {
+    @apply bg-white/30;
+  }
+
+  .status-dot.connecting {
+    @apply bg-accent-amber;
+    animation: pulse-dot 1.5s ease-in-out infinite;
+  }
+
+  .status-dot.error {
+    @apply bg-accent-red;
+  }
+
+  @keyframes pulse-dot {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
+  .slider-input {
+    @apply w-full h-1.5 bg-white/10 rounded-full appearance-none cursor-pointer;
+  }
+  .slider-input::-webkit-slider-thumb {
+    @apply appearance-none w-4 h-4 bg-accent-blue rounded-full cursor-pointer;
+    margin-top: -5px;
+  }
+}
